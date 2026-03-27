@@ -1,0 +1,55 @@
+[project]
+name = "graduation-project"
+version = "1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.12.0",
+    "datasets<=4.0.0",
+    "diffusers[torch]>=0.36.0",
+    "einops>=0.8.2",
+    "huggingface-hub>=1.5.0",
+    "ipykernel>=7.1.0",
+    "ipywidgets>=8.1.8",
+    "lightning>=2.6.1",
+    "matplotlib>=3.10.8",
+    "medmnist>=3.0.2",
+    "numpy>=2.4.0",
+    "opencv-python>=4.13.0.92",
+    "pandas>=2.3.3",
+    "scikit-learn>=1.8.0",
+    "seaborn>=0.13.2",
+    "setuptools<82.0.0",
+    "tensorboard>=2.20.0",
+    "torch>=2.9.1",
+    "torchaudio>=2.9.1",
+    "torchvision>=0.24.1",
+    "transformers>=5.2.0",
+]
+
+[project.scripts]
+distill-pathmnist-tokens = "dd_token.distill_pathmnist_tokens:main"
+train-eval-token-classifier = "dd_token.train_eval_token_classifier:main"
+
+[build-system]
+requires = ["hatchling>=1.25.0"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/dd_token"]
+
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
+torchvision = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
+torchaudio = [{ index = "pytorch-cu126", marker = "sys_platform == 'win32'" }]
