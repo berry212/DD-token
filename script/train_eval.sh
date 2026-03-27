@@ -1,0 +1,1 @@
+uv run train-eval-token-classifier --token-dir ./artifacts/pathmnist_tokens --output-dir ./artifacts/token_classifier --epochs 20 --batch-size 512 --lr 3e-4 --d-model 128 --num-layers 4 --ff-dim 256 --dropout 0.1 --label-smoothing 0.0 --warmup-ratio 0.0 --min-lr 1e-5 --grad-clip-norm 1.0 --class-balance-power 0.0 --early-stop-patience 10
