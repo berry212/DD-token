@@ -82,6 +82,48 @@ Run TensorBoard for training logs:
 tensorboard --logdir ./artifacts/token_classifier/tb_logs
 ```
 
+## Train A Simple MLP Head On Distilled Tokens
+
+Train a lightweight classifier with distilled token sequences directly (token embedding + pooled MLP head), and record ACC/AUC, token size, GPU memory peak, and training time:
+
+```bash
+uv run train-eval-token-mlp \
+  --token-dir ./artifacts/pathmnist_tokens \
+  --output-dir ./artifacts/token_mlp_classifier \
+  --embed-dim 128 \
+  --hidden-dim 256 \
+  --epochs 10 \
+  --batch-size 256 \
+  --lr 3e-4
+```
+
+Run TensorBoard for MLP training logs:
+
+```bash
+tensorboard --logdir ./artifacts/token_mlp_classifier/tb_logs
+```
+
+## Train A ResNet On Token Pseudo-Images
+
+Train a ResNet classifier by reshaping distilled token sequences to pseudo-images (with automatic resize), while recording ACC/AUC, token size, GPU memory peak, and training time:
+
+```bash
+uv run train-eval-token-resnet \
+  --token-dir ./artifacts/pathmnist_tokens \
+  --output-dir ./artifacts/token_resnet_classifier \
+  --model-name resnet18 \
+  --image-size 224 \
+  --epochs 10 \
+  --batch-size 256 \
+  --lr 3e-4
+```
+
+Run TensorBoard for ResNet training logs:
+
+```bash
+tensorboard --logdir ./artifacts/token_resnet_classifier/tb_logs
+```
+
 ## Train A ViT Baseline On PathMNIST
 
 Train an image-level ViT baseline with Lightning and TensorBoard, while profiling token size usage, GPU memory, and training time:
