@@ -1,9 +1,8 @@
-# DD-token: Token Distillation (PathMNIST + NIH Chest X-ray)
+# DD-token: Token Distillation (PathMNIST)
 
 This project provides a practical token distillation pipeline for:
 
 - PathMNIST (multiclass)
-- NIH Chest X-ray (alkzar90/NIH-Chest-X-ray-dataset, 14 disease labels, multilabel)
 
 1. Image preprocessing (normalization + optional denoise)
 2. Overlapping patch extraction
@@ -41,40 +40,6 @@ Run TensorBoard for distillation logs:
 tensorboard --logdir ./artifacts/pathmnist_tokens/tb_logs
 ```
 
-Run NIH Chest X-ray distillation (resize to 256x256):
-
-```bash
-uv run distill-pathmnist-tokens \
-  --dataset nih-chest-xray \
-  --output-dir ./artifacts/nih_tokens_256 \
-  --epochs 8 \
-  --batch-size 64 \
-  --patch-size 8 \
-  --overlap 0.2 \
-  --codebook-size 2048 \
-  --code-dim 256 \
-  --hidden-dim 384 \
-  --cls-weight 0.4 \
-  --image-size 256
-```
-
-Run NIH Chest X-ray distillation without resize (keep original resolution):
-
-```bash
-uv run distill-pathmnist-tokens \
-  --dataset nih-chest-xray \
-  --output-dir ./artifacts/nih_tokens_native \
-  --epochs 8 \
-  --batch-size 16 \
-  --patch-size 8 \
-  --overlap 0.2 \
-  --codebook-size 2048 \
-  --code-dim 256 \
-  --hidden-dim 384 \
-  --cls-weight 0.4 \
-  --image-size 0
-```
-
 ## Outputs
 
 The script writes the following files under the output directory:
@@ -88,7 +53,7 @@ The script writes the following files under the output directory:
 Each `*_tokens.npz` contains:
 
 - `tokens`: shape `[N, L]`, where `L` is patch token length per image
-- `labels`: multiclass `[N]` or multilabel `[N, C]`
+- `labels`: multiclass `[N]`
 
 ## Notes
 
@@ -105,27 +70,8 @@ PathMNIST example:
 uv run train-eval-token-classifier \
   --token-dir ./artifacts/pathmnist_tokens \
   --output-dir ./artifacts/token_classifier \
-  --epochs 20 \
-  --batch-size 512 \
-  --lr 3e-4 \
-  --d-model 128 \
-  --num-layers 4 \
-  --ff-dim 256 \
-  --dropout 0.1 \
-  --label-smoothing 0.0 \
-  --warmup-ratio 0.0 \
-  --class-balance-power 0.0
-```
-
-NIH multilabel example:
-
-```bash
-uv run train-eval-token-classifier \
-  --token-dir ./artifacts/nih_tokens_256 \
-  --output-dir ./artifacts/nih_token_classifier \
-  --task-type multilabel \
-  --threshold 0.5 \
-  --epochs 20 \
+  --model-name vit_tiny_patch16_224 \
+  --epochs 10 \
   --batch-size 256 \
   --lr 3e-4
 ```
@@ -135,6 +81,35 @@ Run TensorBoard for training logs:
 ```bash
 tensorboard --logdir ./artifacts/token_classifier/tb_logs
 ```
+
+## Train A ViT Baseline On PathMNIST
+
+Train an image-level ViT baseline with Lightning and TensorBoard, while profiling token size usage, GPU memory, and training time:
+
+```bash
+uv run train-pathmnist-vit \
+  --data-root ./data \
+  --output-dir ./artifacts/pathmnist_vit \
+  --epochs 20 \
+  --batch-size 256 \
+  --model-name vit_tiny_patch16_224 \
+  --image-size 224 \
+  --lr 3e-4
+```
+
+Run TensorBoard for ViT training logs:
+
+```bash
+tensorboard --logdir ./artifacts/pathmnist_vit/tb_logs
+```
+
+`./artifacts/pathmnist_vit/metrics.json` includes:
+
+- full training config
+- token statistics (patch token count, token bytes per image/split/total)
+- training profile (total and per-epoch train time, peak GPU memory allocated/reserved)
+- best checkpoint and test metrics (including ACC and AUC)
+- TensorBoard log directory
 
 Outputs:
 

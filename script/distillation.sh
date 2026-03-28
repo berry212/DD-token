@@ -4,7 +4,7 @@
 uv run distill-pathmnist-tokens --dataset pathmnist \
     --data-root ./data \
     --output-dir ./artifacts/pathmnist_tokens \
-    --epochs 16 \
+    --epochs 5 \
     --batch-size 256 \
     --patch-size 4 \
     --overlap 0.2 \

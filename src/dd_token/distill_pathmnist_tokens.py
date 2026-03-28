@@ -1,6 +1,7 @@
 import argparse
 import json
 import math
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -10,29 +11,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
-from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from medmnist import PathMNIST
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision import transforms
-
-NIH_14_LABELS = [
-    "Atelectasis",
-    "Cardiomegaly",
-    "Effusion",
-    "Infiltration",
-    "Mass",
-    "Nodule",
-    "Pneumonia",
-    "Pneumothorax",
-    "Consolidation",
-    "Edema",
-    "Emphysema",
-    "Fibrosis",
-    "Pleural_Thickening",
-    "Hernia",
-]
 
 
 @dataclass
@@ -65,10 +48,6 @@ class DistillConfig:
     blur: bool = True
     seed: int = 42
     image_size: int = 256
-    hf_dataset_name: str = "alkzar90/NIH-Chest-X-ray-dataset"
-    hf_config_name: str = "image-classification"
-    hf_trust_remote_code: bool = True
-    val_ratio: float = 0.1
     accelerator: str = "auto"
     devices: int = 1
     precision: str = "32"
@@ -78,6 +57,16 @@ class DistillConfig:
 def set_seed(seed: int) -> None:
     L.seed_everything(seed, workers=True)
     np.random.seed(seed)
+
+
+def format_bytes(num_bytes: int) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B"
+    if num_bytes < 1024**2:
+        return f"{num_bytes / 1024.0:.2f} KB"
+    if num_bytes < 1024**3:
+        return f"{num_bytes / (1024.0**2):.2f} MB"
+    return f"{num_bytes / (1024.0**3):.2f} GB"
 
 
 def build_sincos_position(length: int, dim: int, device: torch.device) -> torch.Tensor:
@@ -241,44 +230,6 @@ class ContextualPatchTokenizer(nn.Module):
         return indices.reshape(bsz, -1)
 
 
-class HFDatasetAdapter(Dataset):
-    def __init__(self, hf_split, transform, label_names: list[str]):
-        self.hf_split = hf_split
-        self.transform = transform
-        self.label_names = label_names
-        self.label_to_idx = {name: idx for idx, name in enumerate(label_names)}
-
-    def __len__(self) -> int:
-        return len(self.hf_split)
-
-    def _to_multihot(self, raw_labels) -> torch.Tensor:
-        out = torch.zeros(len(self.label_names), dtype=torch.float32)
-        if raw_labels is None:
-            return out
-
-        for item in raw_labels:
-            if isinstance(item, str):
-                if item == "No Finding":
-                    continue
-                if item in self.label_to_idx:
-                    out[self.label_to_idx[item]] = 1.0
-            else:
-                idx = int(item)
-                if idx <= 0:
-                    continue
-                mapped_idx = idx - 1
-                if 0 <= mapped_idx < len(self.label_names):
-                    out[mapped_idx] = 1.0
-        return out
-
-    def __getitem__(self, idx):
-        row = self.hf_split[idx]
-        image = row["image"].convert("RGB")
-        labels = self._to_multihot(row.get("labels", []))
-        image = self.transform(image)
-        return image, labels
-
-
 def extract_patches(images: torch.Tensor, patch_size: int, overlap: float):
     if not 0 <= overlap < 1:
         raise ValueError("overlap must be in [0, 1).")
@@ -313,38 +264,6 @@ def make_pathmnist_datasets(cfg: DistillConfig):
     return train_set, val_set, test_set, metadata
 
 
-def make_nih_datasets(cfg: DistillConfig):
-    transform = build_transforms(cfg.blur, cfg.image_size)
-    hf_train = load_dataset(
-        cfg.hf_dataset_name,
-        cfg.hf_config_name,
-        split="train",
-        trust_remote_code=cfg.hf_trust_remote_code,
-    )
-    hf_test = load_dataset(
-        cfg.hf_dataset_name,
-        cfg.hf_config_name,
-        split="test",
-        trust_remote_code=cfg.hf_trust_remote_code,
-    )
-
-    split_train_val = hf_train.train_test_split(test_size=cfg.val_ratio, seed=cfg.seed)
-    train_set = HFDatasetAdapter(split_train_val["train"], transform, NIH_14_LABELS)
-    val_set = HFDatasetAdapter(split_train_val["test"], transform, NIH_14_LABELS)
-    test_set = HFDatasetAdapter(hf_test, transform, NIH_14_LABELS)
-
-    metadata = {"task_type": "multilabel", "num_targets": len(NIH_14_LABELS), "label_names": NIH_14_LABELS}
-    return train_set, val_set, test_set, metadata
-
-
-def make_datasets(cfg: DistillConfig):
-    if cfg.dataset == "pathmnist":
-        return make_pathmnist_datasets(cfg)
-    if cfg.dataset == "nih-chest-xray":
-        return make_nih_datasets(cfg)
-    raise ValueError(f"Unsupported dataset: {cfg.dataset}")
-
-
 class DistillDataModule(L.LightningDataModule):
     def __init__(self, cfg: DistillConfig):
         super().__init__()
@@ -359,7 +278,7 @@ class DistillDataModule(L.LightningDataModule):
         self.in_channels = 3
 
     def setup(self, stage: str | None = None):
-        train_set, val_set, test_set, meta = make_datasets(self.cfg)
+        train_set, val_set, test_set, meta = make_pathmnist_datasets(self.cfg)
         self.train_set = train_set
         self.val_set = val_set
         self.test_set = test_set
@@ -537,6 +456,84 @@ class LitVQDistiller(L.LightningModule):
         }
 
 
+class DistillProfileCallback(Callback):
+    def __init__(self):
+        super().__init__()
+        self.fit_start_time: float | None = None
+        self.epoch_start_time: float | None = None
+        self.total_distill_time_sec: float = 0.0
+        self.epoch_distill_time_sec: list[float] = []
+        self.epoch_peak_allocated_mb: list[float] = []
+        self.epoch_peak_reserved_mb: list[float] = []
+
+    def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        self.fit_start_time = time.perf_counter()
+        self.epoch_distill_time_sec.clear()
+        self.epoch_peak_allocated_mb.clear()
+        self.epoch_peak_reserved_mb.clear()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        self.epoch_start_time = time.perf_counter()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
+    def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self.epoch_start_time is None:
+            return
+
+        duration = float(time.perf_counter() - self.epoch_start_time)
+        self.epoch_distill_time_sec.append(duration)
+
+        if torch.cuda.is_available():
+            allocated_mb = float(torch.cuda.max_memory_allocated() / (1024.0**2))
+            reserved_mb = float(torch.cuda.max_memory_reserved() / (1024.0**2))
+            self.epoch_peak_allocated_mb.append(allocated_mb)
+            self.epoch_peak_reserved_mb.append(reserved_mb)
+
+            if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+                experiment = trainer.logger.experiment
+                if hasattr(experiment, "add_scalar"):
+                    epoch_idx = int(trainer.current_epoch + 1)
+                    experiment.add_scalar("profile/epoch_peak_allocated_mb", allocated_mb, epoch_idx)
+                    experiment.add_scalar("profile/epoch_peak_reserved_mb", reserved_mb, epoch_idx)
+
+        if trainer.logger is not None and hasattr(trainer.logger, "experiment"):
+            experiment = trainer.logger.experiment
+            if hasattr(experiment, "add_scalar"):
+                epoch_idx = int(trainer.current_epoch + 1)
+                experiment.add_scalar("profile/epoch_distill_time_sec", duration, epoch_idx)
+
+    def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        if self.fit_start_time is None:
+            return
+        self.total_distill_time_sec = float(time.perf_counter() - self.fit_start_time)
+
+    def summary(self) -> dict:
+        out = {
+            "total_distill_time_sec": self.total_distill_time_sec,
+            "epoch_distill_time_sec": self.epoch_distill_time_sec,
+            "avg_epoch_distill_time_sec": float(sum(self.epoch_distill_time_sec) / max(1, len(self.epoch_distill_time_sec))),
+        }
+
+        if self.epoch_peak_allocated_mb:
+            out["epoch_peak_allocated_mb"] = self.epoch_peak_allocated_mb
+            out["peak_allocated_mb"] = float(max(self.epoch_peak_allocated_mb))
+        else:
+            out["epoch_peak_allocated_mb"] = []
+            out["peak_allocated_mb"] = None
+
+        if self.epoch_peak_reserved_mb:
+            out["epoch_peak_reserved_mb"] = self.epoch_peak_reserved_mb
+            out["peak_reserved_mb"] = float(max(self.epoch_peak_reserved_mb))
+        else:
+            out["epoch_peak_reserved_mb"] = []
+            out["peak_reserved_mb"] = None
+
+        return out
+
+
 @torch.no_grad()
 def export_split_tokens(
     split_name: str,
@@ -569,8 +566,27 @@ def export_split_tokens(
     np.savez_compressed(output_path, tokens=tokens_np, labels=labels_np)
     print(f"saved {split_name}: {output_path} | tokens shape={tokens_np.shape} | labels shape={labels_np.shape}")
 
+    raw_tokens_bytes = int(tokens_np.nbytes)
+    raw_labels_bytes = int(labels_np.nbytes)
+    raw_total_bytes = raw_tokens_bytes + raw_labels_bytes
+    file_bytes = int(output_path.stat().st_size)
+    return {
+        "num_samples": int(tokens_np.shape[0]),
+        "tokens_shape": list(tokens_np.shape),
+        "labels_shape": list(labels_np.shape),
+        "raw_tokens_bytes": raw_tokens_bytes,
+        "raw_tokens_human": format_bytes(raw_tokens_bytes),
+        "raw_labels_bytes": raw_labels_bytes,
+        "raw_labels_human": format_bytes(raw_labels_bytes),
+        "raw_total_bytes": raw_total_bytes,
+        "raw_total_human": format_bytes(raw_total_bytes),
+        "npz_file_bytes": file_bytes,
+        "npz_file_human": format_bytes(file_bytes),
+    }
+
 
 def train_tokenizer(cfg: DistillConfig):
+    pipeline_start_time = time.perf_counter()
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -598,6 +614,7 @@ def train_tokenizer(cfg: DistillConfig):
     )
     early_stop = EarlyStopping(monitor=monitor_metric, mode="max", patience=max(3, cfg.epochs // 4))
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    profile_callback = DistillProfileCallback()
 
     trainer = L.Trainer(
         max_epochs=cfg.epochs,
@@ -605,7 +622,7 @@ def train_tokenizer(cfg: DistillConfig):
         devices=cfg.devices,
         precision=cfg.precision,
         logger=tb_logger,
-        callbacks=[ckpt_callback, early_stop, lr_monitor],
+        callbacks=[ckpt_callback, early_stop, lr_monitor, profile_callback],
         log_every_n_steps=cfg.log_every_n_steps,
     )
 
@@ -620,9 +637,16 @@ def train_tokenizer(cfg: DistillConfig):
     model = model.to(device)
     tokenizer = model.tokenizer
 
-    export_split_tokens("train", dm.train_dataloader(), tokenizer, cfg.overlap, output_dir, device)
-    export_split_tokens("val", dm.val_dataloader(), tokenizer, cfg.overlap, output_dir, device)
-    export_split_tokens("test", dm.test_dataloader(), tokenizer, cfg.overlap, output_dir, device)
+    export_start_time = time.perf_counter()
+    token_size_splits = {
+        "train": export_split_tokens("train", dm.train_dataloader(), tokenizer, cfg.overlap, output_dir, device),
+        "val": export_split_tokens("val", dm.val_dataloader(), tokenizer, cfg.overlap, output_dir, device),
+        "test": export_split_tokens("test", dm.test_dataloader(), tokenizer, cfg.overlap, output_dir, device),
+    }
+    token_export_time_sec = float(time.perf_counter() - export_start_time)
+    total_pipeline_time_sec = float(time.perf_counter() - pipeline_start_time)
+
+    profile_summary = profile_callback.summary()
 
     torch.save(tokenizer.state_dict(), output_dir / "vq_tokenizer.pt")
 
@@ -653,19 +677,43 @@ def train_tokenizer(cfg: DistillConfig):
         "best_checkpoint": best_ckpt,
         "best_score": float(ckpt_callback.best_model_score.item()) if ckpt_callback.best_model_score is not None else None,
         "tensorboard_log_dir": tb_logger.log_dir,
-        "hf_dataset_name": cfg.hf_dataset_name if cfg.dataset == "nih-chest-xray" else None,
-        "hf_config_name": cfg.hf_config_name if cfg.dataset == "nih-chest-xray" else None,
     }
+
+    total_raw_bytes = sum(v["raw_total_bytes"] for v in token_size_splits.values())
+    total_npz_file_bytes = sum(v["npz_file_bytes"] for v in token_size_splits.values())
+    metadata["token_size_stats"] = {
+        "splits": token_size_splits,
+        "total": {
+            "raw_total_bytes": int(total_raw_bytes),
+            "raw_total_human": format_bytes(int(total_raw_bytes)),
+            "npz_file_bytes": int(total_npz_file_bytes),
+            "npz_file_human": format_bytes(int(total_npz_file_bytes)),
+        },
+    }
+    metadata["distill_profile"] = {
+        **profile_summary,
+        "token_export_time_sec": token_export_time_sec,
+        "total_pipeline_time_sec": total_pipeline_time_sec,
+    }
+
     with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     print(f"saved model + metadata to {output_dir}")
     print(f"tensorboard logs at {tb_logger.log_dir}")
+    total_stats = metadata["token_size_stats"]["total"]
+    distill_stats = metadata["distill_profile"]
+    print(
+        f"pathmnist token_size(raw={total_stats['raw_total_human']}, npz={total_stats['npz_file_human']}) "
+        f"distill_time={distill_stats['total_distill_time_sec']:.2f}s "
+        f"peak_allocated={distill_stats.get('peak_allocated_mb')}MB "
+        f"peak_reserved={distill_stats.get('peak_reserved_mb')}MB"
+    )
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Distill image datasets into discrete tokens with a Lightning VQ tokenizer.")
-    parser.add_argument("--dataset", type=str, default="pathmnist", choices=["pathmnist", "nih-chest-xray"])
+    parser.add_argument("--dataset", type=str, default="pathmnist", choices=["pathmnist"])
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./artifacts/pathmnist_tokens")
     parser.add_argument("--epochs", type=int, default=12)
@@ -691,11 +739,6 @@ def parse_args():
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)
-
-    parser.add_argument("--hf-dataset-name", type=str, default="alkzar90/NIH-Chest-X-ray-dataset")
-    parser.add_argument("--hf-config-name", type=str, default="image-classification")
-    parser.add_argument("--hf-no-trust-remote-code", action="store_true")
-    parser.add_argument("--val-ratio", type=float, default=0.1)
 
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
@@ -733,10 +776,6 @@ def main():
         blur=not args.no_blur,
         image_size=args.image_size,
         seed=args.seed,
-        hf_dataset_name=args.hf_dataset_name,
-        hf_config_name=args.hf_config_name,
-        hf_trust_remote_code=not args.hf_no_trust_remote_code,
-        val_ratio=args.val_ratio,
         accelerator=args.accelerator,
         devices=args.devices,
         precision=args.precision,
