@@ -1,11 +1,15 @@
 import argparse
+from bisect import bisect_right
+from io import BytesIO
 import json
 import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import lightning as L
+from huggingface_hub import HfApi, snapshot_download
 import medmnist
 import numpy as np
 import torch
@@ -14,8 +18,19 @@ import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from medmnist import PathMNIST
-from torch.utils.data import DataLoader
+from PIL import Image
+from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
+
+
+HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
+_SKIN_LESIONS_ALIASES = {
+    HF_SKIN_LESIONS_REPO_ID,
+    "skin-lesions",
+    "skin_lesions",
+    "skin-lesions-classification",
+}
+SUPPORTED_DATASET_CHOICES = ["pathmnist", "skin-lesions", HF_SKIN_LESIONS_REPO_ID]
 
 
 @dataclass
@@ -36,7 +51,7 @@ class DistillConfig:
     attention_heads: int = 8
     ff_mult: int = 4
     rvq_stages: int = 2
-    num_workers: int = 4
+    num_workers: int = 0
     recon_weight: float = 1.0
     commit_weight: float = 0.25
     cls_weight: float = 0.4
@@ -52,6 +67,16 @@ class DistillConfig:
     devices: int = 1
     precision: str = "32"
     log_every_n_steps: int = 20
+
+
+def _import_pyarrow_parquet():
+    try:
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise ImportError(
+            "pyarrow is required for Hugging Face parquet datasets. Install it with `uv add pyarrow`."
+        ) from exc
+    return pq
 
 
 def set_seed(seed: int) -> None:
@@ -251,6 +276,119 @@ def build_transforms(blur: bool, image_size: int):
     return transforms.Compose(transforms_list)
 
 
+class HFParquetImageDataset(Dataset):
+    def __init__(
+        self,
+        parquet_paths: list[Path],
+        transform,
+        image_column: str = "image",
+        label_column: str = "label",
+    ):
+        if not parquet_paths:
+            raise ValueError("parquet_paths cannot be empty.")
+
+        self.parquet_paths = [Path(p) for p in parquet_paths]
+        self.transform = transform
+        self.image_column = image_column
+        self.label_column = label_column
+
+        self._index_map: list[tuple[int, int, int]] = []
+        self._cumulative_rows: list[int] = []
+        self._length = 0
+
+        self._parquet_files: dict[int, Any] = {}
+        self._cached_group_key: tuple[int, int] | None = None
+        self._cached_images: list[Any] | None = None
+        self._cached_labels: list[Any] | None = None
+
+        pq = _import_pyarrow_parquet()
+        for file_idx, parquet_path in enumerate(self.parquet_paths):
+            parquet_file = pq.ParquetFile(str(parquet_path))
+            for row_group_idx in range(parquet_file.num_row_groups):
+                num_rows = int(parquet_file.metadata.row_group(row_group_idx).num_rows)
+                if num_rows <= 0:
+                    continue
+                self._length += num_rows
+                self._index_map.append((file_idx, row_group_idx, num_rows))
+                self._cumulative_rows.append(self._length)
+
+        if self._length <= 0:
+            raise ValueError("No rows found in parquet files.")
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_parquet_files"] = {}
+        state["_cached_group_key"] = None
+        state["_cached_images"] = None
+        state["_cached_labels"] = None
+        return state
+
+    def __len__(self) -> int:
+        return self._length
+
+    def _decode_image(self, value: Any) -> Image.Image:
+        if isinstance(value, dict):
+            img_bytes = value.get("bytes")
+            img_path = value.get("path")
+
+            if img_bytes is not None:
+                with Image.open(BytesIO(img_bytes)) as img:
+                    return img.convert("RGB")
+
+            if img_path:
+                with Image.open(img_path) as img:
+                    return img.convert("RGB")
+
+        if isinstance(value, (bytes, bytearray)):
+            with Image.open(BytesIO(value)) as img:
+                return img.convert("RGB")
+
+        if isinstance(value, str):
+            with Image.open(value) as img:
+                return img.convert("RGB")
+
+        raise ValueError(f"Unsupported image value type: {type(value)}")
+
+    def _load_row_group(self, file_idx: int, row_group_idx: int) -> None:
+        key = (file_idx, row_group_idx)
+        if self._cached_group_key == key:
+            return
+
+        parquet_file = self._parquet_files.get(file_idx)
+        if parquet_file is None:
+            pq = _import_pyarrow_parquet()
+            parquet_file = pq.ParquetFile(str(self.parquet_paths[file_idx]))
+            self._parquet_files[file_idx] = parquet_file
+
+        table = parquet_file.read_row_group(row_group_idx, columns=[self.image_column, self.label_column])
+        self._cached_images = table.column(self.image_column).to_pylist()
+        self._cached_labels = table.column(self.label_column).to_pylist()
+        self._cached_group_key = key
+
+    def __getitem__(self, index):
+        if index < 0:
+            index = self._length + index
+
+        if index < 0 or index >= self._length:
+            raise IndexError(f"Index {index} out of range for dataset of length {self._length}.")
+
+        group_idx = bisect_right(self._cumulative_rows, index)
+        prev_cumulative = 0 if group_idx == 0 else self._cumulative_rows[group_idx - 1]
+        row_in_group = int(index - prev_cumulative)
+
+        file_idx, row_group_idx, _ = self._index_map[group_idx]
+        self._load_row_group(file_idx, row_group_idx)
+
+        if self._cached_images is None or self._cached_labels is None:
+            raise RuntimeError("Parquet row group cache is unexpectedly empty.")
+
+        image = self._decode_image(self._cached_images[row_in_group])
+        label = int(self._cached_labels[row_in_group])
+
+        image_tensor = self.transform(image) if self.transform is not None else image
+        return image_tensor, torch.tensor(label, dtype=torch.long)
+
+
 def make_pathmnist_datasets(cfg: DistillConfig):
     Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
     transform = build_transforms(cfg.blur, cfg.image_size)
@@ -262,6 +400,139 @@ def make_pathmnist_datasets(cfg: DistillConfig):
     label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(num_targets)]
     metadata = {"task_type": "multiclass", "num_targets": num_targets, "label_names": label_names}
     return train_set, val_set, test_set, metadata
+
+
+def _dataset_name_kind(dataset_name: str) -> str:
+    normalized = dataset_name.strip().lower()
+    if normalized == "pathmnist":
+        return "pathmnist"
+    if normalized in {name.lower() for name in _SKIN_LESIONS_ALIASES}:
+        return "hf_skin_lesions"
+    raise ValueError(
+        f"Unsupported dataset '{dataset_name}'. Supported values: {SUPPORTED_DATASET_CHOICES}."
+    )
+
+
+def _collect_parquet_split_files(snapshot_dir: Path, split_name: str) -> list[Path]:
+    data_dir = snapshot_dir / "data"
+    patterns = [f"{split_name}-*.parquet"]
+    if split_name == "validation":
+        patterns.append("val-*.parquet")
+
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for pattern in patterns:
+        for path in sorted(data_dir.glob(pattern)):
+            resolved = path.resolve()
+            if resolved not in seen:
+                seen.add(resolved)
+                files.append(path)
+    return files
+
+
+def _extract_hf_label_names(repo_id: str) -> list[str]:
+    info = HfApi().dataset_info(repo_id=repo_id)
+    card_data = info.cardData.to_dict() if info.cardData is not None else {}
+    dataset_info = card_data.get("dataset_info") if isinstance(card_data, dict) else None
+    features = dataset_info.get("features", []) if isinstance(dataset_info, dict) else []
+
+    for feature in features:
+        if not isinstance(feature, dict) or feature.get("name") != "label":
+            continue
+        dtype = feature.get("dtype")
+        if not isinstance(dtype, dict):
+            continue
+        class_label = dtype.get("class_label")
+        if not isinstance(class_label, dict):
+            continue
+
+        names = class_label.get("names")
+        if isinstance(names, list):
+            return [str(name) for name in names]
+        if isinstance(names, dict):
+            pairs = []
+            for key, value in names.items():
+                try:
+                    idx = int(key)
+                except (TypeError, ValueError):
+                    continue
+                pairs.append((idx, str(value)))
+            if pairs:
+                pairs.sort(key=lambda x: x[0])
+                return [name for _, name in pairs]
+    return []
+
+
+def _infer_num_targets_from_parquet(parquet_paths: list[Path], label_column: str = "label") -> int:
+    max_label = -1
+    pq = _import_pyarrow_parquet()
+    for parquet_path in parquet_paths:
+        parquet_file = pq.ParquetFile(str(parquet_path))
+        for row_group_idx in range(parquet_file.num_row_groups):
+            label_table = parquet_file.read_row_group(row_group_idx, columns=[label_column])
+            labels = label_table.column(label_column).to_pylist()
+            for label in labels:
+                max_label = max(max_label, int(label))
+    if max_label < 0:
+        raise ValueError("Could not infer target count from parquet label column.")
+    return max_label + 1
+
+
+def make_hf_skin_lesions_datasets(cfg: DistillConfig):
+    Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
+    transform = build_transforms(cfg.blur, cfg.image_size)
+
+    snapshot_dir = Path(
+        snapshot_download(
+            repo_id=HF_SKIN_LESIONS_REPO_ID,
+            repo_type="dataset",
+            allow_patterns=["README.md", "data/*.parquet"],
+            cache_dir=str(Path(cfg.data_root) / "hf_cache"),
+        )
+    )
+
+    train_files = _collect_parquet_split_files(snapshot_dir, "train")
+    val_files = _collect_parquet_split_files(snapshot_dir, "validation")
+    test_files = _collect_parquet_split_files(snapshot_dir, "test")
+
+    if not train_files or not val_files or not test_files:
+        raise ValueError(
+            "Failed to find complete train/validation/test parquet splits in the downloaded Hugging Face dataset."
+        )
+
+    train_set = HFParquetImageDataset(train_files, transform=transform)
+    val_set = HFParquetImageDataset(val_files, transform=transform)
+    test_set = HFParquetImageDataset(test_files, transform=transform)
+
+    label_names = _extract_hf_label_names(HF_SKIN_LESIONS_REPO_ID)
+    if label_names:
+        num_targets = len(label_names)
+    else:
+        num_targets = _infer_num_targets_from_parquet(train_files + val_files + test_files)
+        label_names = [str(i) for i in range(num_targets)]
+
+    metadata = {
+        "task_type": "multiclass",
+        "num_targets": num_targets,
+        "label_names": label_names,
+        "hf_repo_id": HF_SKIN_LESIONS_REPO_ID,
+        "hf_snapshot_dir": str(snapshot_dir),
+        "split_files": {
+            "train": [str(path) for path in train_files],
+            "validation": [str(path) for path in val_files],
+            "test": [str(path) for path in test_files],
+        },
+    }
+    return train_set, val_set, test_set, metadata
+
+
+def make_datasets(cfg: DistillConfig):
+    kind = _dataset_name_kind(cfg.dataset)
+    if kind == "pathmnist":
+        return make_pathmnist_datasets(cfg)
+    if kind == "hf_skin_lesions":
+        return make_hf_skin_lesions_datasets(cfg)
+    raise ValueError(f"Unsupported dataset kind: {kind}")
 
 
 class DistillDataModule(L.LightningDataModule):
@@ -278,7 +549,7 @@ class DistillDataModule(L.LightningDataModule):
         self.in_channels = 3
 
     def setup(self, stage: str | None = None):
-        train_set, val_set, test_set, meta = make_pathmnist_datasets(self.cfg)
+        train_set, val_set, test_set, meta = make_datasets(self.cfg)
         self.train_set = train_set
         self.val_set = val_set
         self.test_set = test_set
@@ -704,7 +975,7 @@ def train_tokenizer(cfg: DistillConfig):
     total_stats = metadata["token_size_stats"]["total"]
     distill_stats = metadata["distill_profile"]
     print(
-        f"pathmnist token_size(raw={total_stats['raw_total_human']}, npz={total_stats['npz_file_human']}) "
+        f"{cfg.dataset} token_size(raw={total_stats['raw_total_human']}, npz={total_stats['npz_file_human']}) "
         f"distill_time={distill_stats['total_distill_time_sec']:.2f}s "
         f"peak_allocated={distill_stats.get('peak_allocated_mb')}MB "
         f"peak_reserved={distill_stats.get('peak_reserved_mb')}MB"
@@ -713,7 +984,7 @@ def train_tokenizer(cfg: DistillConfig):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Distill image datasets into discrete tokens with a Lightning VQ tokenizer.")
-    parser.add_argument("--dataset", type=str, default="pathmnist", choices=["pathmnist"])
+    parser.add_argument("--dataset", type=str, default="pathmnist", choices=SUPPORTED_DATASET_CHOICES)
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./artifacts/pathmnist_tokens")
     parser.add_argument("--epochs", type=int, default=12)
@@ -735,7 +1006,7 @@ def parse_args():
     parser.add_argument("--quant-temperature", type=float, default=1.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr", type=float, default=1e-5)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--image-size", type=int, default=256)
     parser.add_argument("--seed", type=int, default=42)

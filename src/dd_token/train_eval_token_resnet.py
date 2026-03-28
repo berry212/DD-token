@@ -19,6 +19,7 @@ from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
 @dataclass
 class TrainConfig:
+    dataset: str
     token_dir: str
     output_dir: str
     model_name: str = "resnet18"
@@ -39,6 +40,33 @@ class TrainConfig:
     devices: int = 1
     precision: str = "32"
     log_every_n_steps: int = 20
+
+
+HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
+
+
+def normalize_dataset_name(dataset: str) -> str:
+    normalized = dataset.strip().lower()
+    if normalized == "pathmnist":
+        return "pathmnist"
+    if normalized in {"skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID.lower()}:
+        return "skin-lesions"
+    raise ValueError(
+        "Unsupported dataset name. Supported values: pathmnist, skin-lesions, "
+        f"{HF_SKIN_LESIONS_REPO_ID}."
+    )
+
+
+def default_token_dir_for_dataset(dataset: str) -> str:
+    if dataset == "skin-lesions":
+        return "./artifacts/skin_lesions_tokens"
+    return "./artifacts/pathmnist_tokens"
+
+
+def default_output_dir_for_dataset(dataset: str) -> str:
+    if dataset == "skin-lesions":
+        return "./artifacts/skin_lesions_token_resnet_classifier"
+    return "./artifacts/token_resnet_classifier"
 
 
 def set_seed(seed: int) -> None:
@@ -612,6 +640,7 @@ def train(cfg: TrainConfig) -> None:
     metrics = {
         "config": asdict(cfg),
         "dataset": {
+            "name": cfg.dataset,
             "vocab_size": dm.vocab_size,
             "seq_len": dm.seq_len,
             "num_classes": dm.num_classes,
@@ -650,8 +679,14 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and evaluate a distilled-token pseudo-image ResNet classifier with Lightning."
     )
-    parser.add_argument("--token-dir", type=str, default="./artifacts/pathmnist_tokens")
-    parser.add_argument("--output-dir", type=str, default="./artifacts/token_resnet_classifier")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="pathmnist",
+        choices=["pathmnist", "skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID],
+    )
+    parser.add_argument("--token-dir", type=str, default=None)
+    parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--model-name", type=str, default="resnet18")
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=10)
@@ -676,9 +711,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    dataset = normalize_dataset_name(args.dataset)
+    token_dir = args.token_dir if args.token_dir is not None else default_token_dir_for_dataset(dataset)
+    output_dir = args.output_dir if args.output_dir is not None else default_output_dir_for_dataset(dataset)
+
     cfg = TrainConfig(
-        token_dir=args.token_dir,
-        output_dir=args.output_dir,
+        dataset=dataset,
+        token_dir=token_dir,
+        output_dir=output_dir,
         model_name=args.model_name,
         image_size=args.image_size,
         epochs=args.epochs,

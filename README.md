@@ -1,8 +1,9 @@
-# DD-token: Token Distillation (PathMNIST)
+# DD-token: Token Distillation
 
 This project provides a practical token distillation pipeline for:
 
 - PathMNIST (multiclass)
+- Skin Lesions (Hugging Face: ahmed-ai/skin-lesions-classification-dataset, multiclass)
 
 1. Image preprocessing (normalization + optional denoise)
 2. Overlapping patch extraction
@@ -33,6 +34,28 @@ uv run distill-pathmnist-tokens \
   --hidden-dim 384 \
   --cls-weight 0.4
 ```
+
+Run Skin Lesions distillation:
+
+```bash
+uv run distill-pathmnist-tokens \
+  --dataset skin-lesions \
+  --data-root ./data \
+  --output-dir ./artifacts/skin_lesions_tokens \
+  --epochs 12 \
+  --batch-size 64 \
+  --patch-size 16 \
+  --overlap 0.2 \
+  --codebook-size 2048 \
+  --code-dim 256 \
+  --hidden-dim 384 \
+  --cls-weight 0.4
+```
+
+Equivalent dataset identifier for `--dataset`:
+
+- `skin-lesions`
+- `ahmed-ai/skin-lesions-classification-dataset`
 
 Run TensorBoard for distillation logs:
 
@@ -68,11 +91,25 @@ PathMNIST example:
 
 ```bash
 uv run train-eval-token-classifier \
+  --dataset pathmnist \
   --token-dir ./artifacts/pathmnist_tokens \
   --output-dir ./artifacts/token_classifier \
   --model-name vit_tiny_patch16_224 \
   --epochs 10 \
   --batch-size 256 \
+  --lr 3e-4
+```
+
+Skin lesions token-classifier example:
+
+```bash
+uv run train-eval-token-classifier \
+  --dataset skin-lesions \
+  --token-dir ./artifacts/skin_lesions_tokens \
+  --output-dir ./artifacts/skin_lesions_token_classifier \
+  --model-name vit_tiny_patch16_224 \
+  --epochs 10 \
+  --batch-size 128 \
   --lr 3e-4
 ```
 
@@ -88,12 +125,27 @@ Train a lightweight classifier with distilled token sequences directly (token em
 
 ```bash
 uv run train-eval-token-mlp \
+  --dataset pathmnist \
   --token-dir ./artifacts/pathmnist_tokens \
   --output-dir ./artifacts/token_mlp_classifier \
   --embed-dim 128 \
   --hidden-dim 256 \
   --epochs 10 \
   --batch-size 256 \
+  --lr 3e-4
+```
+
+Skin lesions token-MLP example:
+
+```bash
+uv run train-eval-token-mlp \
+  --dataset skin-lesions \
+  --token-dir ./artifacts/skin_lesions_tokens \
+  --output-dir ./artifacts/skin_lesions_token_mlp_classifier \
+  --embed-dim 128 \
+  --hidden-dim 256 \
+  --epochs 10 \
+  --batch-size 128 \
   --lr 3e-4
 ```
 
@@ -109,12 +161,27 @@ Train a ResNet classifier by reshaping distilled token sequences to pseudo-image
 
 ```bash
 uv run train-eval-token-resnet \
+  --dataset pathmnist \
   --token-dir ./artifacts/pathmnist_tokens \
   --output-dir ./artifacts/token_resnet_classifier \
   --model-name resnet18 \
   --image-size 224 \
   --epochs 10 \
   --batch-size 256 \
+  --lr 3e-4
+```
+
+Skin lesions token-ResNet example:
+
+```bash
+uv run train-eval-token-resnet \
+  --dataset skin-lesions \
+  --token-dir ./artifacts/skin_lesions_tokens \
+  --output-dir ./artifacts/skin_lesions_token_resnet_classifier \
+  --model-name resnet18 \
+  --image-size 224 \
+  --epochs 10 \
+  --batch-size 128 \
   --lr 3e-4
 ```
 
@@ -130,10 +197,25 @@ Train an image-level ViT baseline with Lightning and TensorBoard, while profilin
 
 ```bash
 uv run train-pathmnist-vit \
+  --dataset pathmnist \
   --data-root ./data \
   --output-dir ./artifacts/pathmnist_vit \
   --epochs 20 \
   --batch-size 256 \
+  --model-name vit_tiny_patch16_224 \
+  --image-size 224 \
+  --lr 3e-4
+```
+
+Skin lesions baseline ViT example:
+
+```bash
+uv run train-pathmnist-vit \
+  --dataset ahmed-ai/skin-lesions-classification-dataset \
+  --data-root ./data \
+  --output-dir ./artifacts/skin_lesions_vit \
+  --epochs 20 \
+  --batch-size 128 \
   --model-name vit_tiny_patch16_224 \
   --image-size 224 \
   --lr 3e-4
