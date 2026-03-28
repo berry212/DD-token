@@ -48,6 +48,11 @@ class DistillConfig:
     codebook_size: int = 2048
     code_dim: int = 256
     hidden_dim: int = 384
+    encoder_layers: int = 3
+    decoder_layers: int = 2
+    attention_heads: int = 8
+    ff_mult: int = 4
+    rvq_stages: int = 2
     num_workers: int = 4
     recon_weight: float = 1.0
     commit_weight: float = 0.25
@@ -75,38 +80,75 @@ def set_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
-class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size: int, code_dim: int, beta: float = 0.25, temperature: float = 1.0):
+def build_sincos_position(length: int, dim: int, device: torch.device) -> torch.Tensor:
+    position = torch.arange(length, device=device, dtype=torch.float32).unsqueeze(1)
+    div_term = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32) * (-math.log(10000.0) / dim))
+    pe = torch.zeros(1, length, dim, device=device)
+    pe[0, :, 0::2] = torch.sin(position * div_term)
+    pe[0, :, 1::2] = torch.cos(position * div_term)
+    return pe
+
+
+class ResidualVectorQuantizer(nn.Module):
+    def __init__(
+        self,
+        num_quantizers: int,
+        codebook_size: int,
+        code_dim: int,
+        beta: float = 0.25,
+        temperature: float = 1.0,
+    ):
         super().__init__()
-        self.codebook = nn.Embedding(codebook_size, code_dim)
+        self.num_quantizers = num_quantizers
         self.beta = beta
         self.temperature = temperature
+        self.codebooks = nn.ModuleList([nn.Embedding(codebook_size, code_dim) for _ in range(num_quantizers)])
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        nn.init.uniform_(self.codebook.weight, -1.0, 1.0)
+        for cb in self.codebooks:
+            nn.init.uniform_(cb.weight, -1.0, 1.0)
+
+    def _distances(self, x: torch.Tensor, codebook: nn.Embedding) -> torch.Tensor:
+        x_sq = (x**2).sum(dim=1, keepdim=True)
+        c_sq = (codebook.weight**2).sum(dim=1)
+        return x_sq + c_sq - 2 * x @ codebook.weight.t()
 
     def forward(self, z_e: torch.Tensor):
-        z_e_sq = (z_e**2).sum(dim=1, keepdim=True)
-        code_sq = (self.codebook.weight**2).sum(dim=1)
-        distances = z_e_sq + code_sq - 2 * z_e @ self.codebook.weight.t()
+        residual = z_e
+        z_q_total = torch.zeros_like(z_e)
+        all_indices = []
+        commit_terms = []
+        diversity_terms = []
 
-        indices = torch.argmin(distances, dim=1)
-        z_q = self.codebook(indices)
-        z_q_st = z_e + (z_q - z_e).detach()
+        for codebook in self.codebooks:
+            distances = self._distances(residual, codebook)
+            indices = torch.argmin(distances, dim=1)
 
-        commit_loss = F.mse_loss(z_e, z_q.detach()) + self.beta * F.mse_loss(z_q, z_e.detach())
+            z_q = codebook(indices)
+            z_q_st = residual + (z_q - residual).detach()
+            z_q_total = z_q_total + z_q_st
 
-        soft_assign = F.softmax(-distances / self.temperature, dim=1)
-        avg_probs = soft_assign.mean(dim=0)
-        entropy = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
-        max_entropy = math.log(self.codebook.num_embeddings)
-        diversity_loss = 1.0 - entropy / max_entropy
+            commit = F.mse_loss(residual, z_q.detach()) + self.beta * F.mse_loss(z_q, residual.detach())
+            commit_terms.append(commit)
 
-        return z_q_st, indices, commit_loss, diversity_loss
+            soft_assign = F.softmax(-distances / self.temperature, dim=1)
+            avg_probs = soft_assign.mean(dim=0)
+            entropy = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
+            max_entropy = math.log(codebook.num_embeddings)
+            diversity = 1.0 - entropy / max_entropy
+            diversity_terms.append(diversity)
+
+            all_indices.append(indices)
+            residual = residual - z_q.detach()
+
+        indices_stacked = torch.stack(all_indices, dim=1)
+        commit_loss = torch.stack(commit_terms).mean()
+        diversity_loss = torch.stack(diversity_terms).mean()
+        return z_q_total, indices_stacked, commit_loss, diversity_loss
 
 
-class PatchVQTokenizer(nn.Module):
+class ContextualPatchTokenizer(nn.Module):
     def __init__(
         self,
         in_channels: int,
@@ -116,47 +158,87 @@ class PatchVQTokenizer(nn.Module):
         codebook_size: int,
         commit_weight: float,
         quant_temperature: float,
+        encoder_layers: int,
+        decoder_layers: int,
+        attention_heads: int,
+        ff_mult: int,
+        rvq_stages: int,
     ):
         super().__init__()
         patch_dim = in_channels * patch_size * patch_size
         self.patch_size = patch_size
-        self.encoder = nn.Sequential(
-            nn.Linear(patch_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, code_dim),
+        self.rvq_stages = rvq_stages
+
+        self.patch_embed = nn.Linear(patch_dim, hidden_dim)
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=attention_heads,
+            dim_feedforward=hidden_dim * ff_mult,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
         )
-        self.quantizer = VectorQuantizer(
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=encoder_layers)
+        self.latent_proj = nn.Linear(hidden_dim, code_dim)
+
+        self.quantizer = ResidualVectorQuantizer(
+            num_quantizers=rvq_stages,
             codebook_size=codebook_size,
             code_dim=code_dim,
             beta=commit_weight,
             temperature=quant_temperature,
         )
-        self.decoder = nn.Sequential(
-            nn.Linear(code_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, patch_dim),
-            nn.Tanh(),
-        )
 
-    def forward(self, patches: torch.Tensor):
-        z_e = self.encoder(patches)
-        z_q_st, indices, commit_loss, diversity_loss = self.quantizer(z_e)
-        recon = self.decoder(z_q_st)
-        recon_loss = F.mse_loss(recon, patches)
-        return recon, z_q_st, indices, recon_loss, commit_loss, diversity_loss
+        self.decode_in = nn.Linear(code_dim, hidden_dim)
+        dec_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=attention_heads,
+            dim_feedforward=hidden_dim * ff_mult,
+            dropout=0.1,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.decoder = nn.TransformerEncoder(dec_layer, num_layers=decoder_layers)
+        self.decode_out = nn.Linear(hidden_dim, patch_dim)
+
+    def encode_latents(self, patches_seq: torch.Tensor) -> torch.Tensor:
+        x = self.patch_embed(patches_seq)
+        x = x + build_sincos_position(x.size(1), x.size(2), x.device)
+        x = self.encoder(x)
+        z_e = self.latent_proj(x)
+        return z_e
+
+    def forward(self, patches_seq: torch.Tensor):
+        bsz, seq_len, code_in = patches_seq.shape
+        _ = code_in
+
+        z_e_seq = self.encode_latents(patches_seq)
+        z_e_flat = z_e_seq.reshape(-1, z_e_seq.size(-1))
+
+        z_q_flat, indices_flat, commit_loss, diversity_loss = self.quantizer(z_e_flat)
+        z_q_seq = z_q_flat.view(bsz, seq_len, -1)
+        indices = indices_flat.view(bsz, seq_len, self.rvq_stages)
+
+        dec = self.decode_in(z_q_seq)
+        dec = dec + build_sincos_position(dec.size(1), dec.size(2), dec.device)
+        dec = self.decoder(dec)
+        recon = torch.tanh(self.decode_out(dec))
+        recon_loss = F.mse_loss(recon, patches_seq)
+
+        return recon, z_q_seq, indices, recon_loss, commit_loss, diversity_loss
 
     @torch.no_grad()
     def encode_tokens(self, images: torch.Tensor, overlap: float):
-        patches, patch_count = extract_patches(images, self.patch_size, overlap)
-        z_e = self.encoder(patches)
+        patches_seq, _ = extract_patches(images, self.patch_size, overlap)
+        z_e_seq = self.encode_latents(patches_seq)
+        bsz, seq_len, _ = z_e_seq.shape
+        z_e_flat = z_e_seq.reshape(-1, z_e_seq.size(-1))
 
-        z_e_sq = (z_e**2).sum(dim=1, keepdim=True)
-        code_sq = (self.quantizer.codebook.weight**2).sum(dim=1)
-        distances = z_e_sq + code_sq - 2 * z_e @ self.quantizer.codebook.weight.t()
-
-        indices = torch.argmin(distances, dim=1)
-        tokens = indices.view(images.size(0), patch_count)
-        return tokens
+        _, indices_flat, _, _ = self.quantizer(z_e_flat)
+        indices = indices_flat.view(bsz, seq_len, self.rvq_stages)
+        return indices.reshape(bsz, -1)
 
 
 class HFDatasetAdapter(Dataset):
@@ -203,7 +285,7 @@ def extract_patches(images: torch.Tensor, patch_size: int, overlap: float):
 
     stride = max(1, int(round(patch_size * (1.0 - overlap))))
     unfolded = F.unfold(images, kernel_size=patch_size, stride=stride)
-    patches = unfolded.transpose(1, 2).reshape(-1, unfolded.size(1))
+    patches = unfolded.transpose(1, 2).contiguous()
     return patches, unfolded.size(-1)
 
 
@@ -227,11 +309,7 @@ def make_pathmnist_datasets(cfg: DistillConfig):
 
     num_targets = len(medmnist.INFO["pathmnist"]["label"])
     label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(num_targets)]
-    metadata = {
-        "task_type": "multiclass",
-        "num_targets": num_targets,
-        "label_names": label_names,
-    }
+    metadata = {"task_type": "multiclass", "num_targets": num_targets, "label_names": label_names}
     return train_set, val_set, test_set, metadata
 
 
@@ -255,11 +333,7 @@ def make_nih_datasets(cfg: DistillConfig):
     val_set = HFDatasetAdapter(split_train_val["test"], transform, NIH_14_LABELS)
     test_set = HFDatasetAdapter(hf_test, transform, NIH_14_LABELS)
 
-    metadata = {
-        "task_type": "multilabel",
-        "num_targets": len(NIH_14_LABELS),
-        "label_names": NIH_14_LABELS,
-    }
+    metadata = {"task_type": "multilabel", "num_targets": len(NIH_14_LABELS), "label_names": NIH_14_LABELS}
     return train_set, val_set, test_set, metadata
 
 
@@ -275,7 +349,6 @@ class DistillDataModule(L.LightningDataModule):
     def __init__(self, cfg: DistillConfig):
         super().__init__()
         self.cfg = cfg
-
         self.train_set = None
         self.val_set = None
         self.test_set = None
@@ -290,6 +363,7 @@ class DistillDataModule(L.LightningDataModule):
         self.train_set = train_set
         self.val_set = val_set
         self.test_set = test_set
+
         self.task_type = meta["task_type"]
         self.num_targets = meta["num_targets"]
         self.label_names = meta["label_names"]
@@ -323,7 +397,7 @@ class LitVQDistiller(L.LightningModule):
         self.cfg = cfg
         self.task_type = task_type
 
-        self.tokenizer = PatchVQTokenizer(
+        self.tokenizer = ContextualPatchTokenizer(
             in_channels=in_channels,
             patch_size=cfg.patch_size,
             hidden_dim=cfg.hidden_dim,
@@ -331,6 +405,11 @@ class LitVQDistiller(L.LightningModule):
             codebook_size=cfg.codebook_size,
             commit_weight=cfg.commit_weight,
             quant_temperature=cfg.quant_temperature,
+            encoder_layers=cfg.encoder_layers,
+            decoder_layers=cfg.decoder_layers,
+            attention_heads=cfg.attention_heads,
+            ff_mult=cfg.ff_mult,
+            rvq_stages=cfg.rvq_stages,
         )
         self.aux_head = nn.Linear(cfg.code_dim, num_targets)
 
@@ -358,11 +437,12 @@ class LitVQDistiller(L.LightningModule):
         return self.cfg.cls_weight + ratio * (self.cfg.cls_weight_end - self.cfg.cls_weight)
 
     def _shared_forward(self, images: torch.Tensor, labels: torch.Tensor):
-        patches, patch_count = extract_patches(images, self.cfg.patch_size, self.cfg.overlap)
-        recon, z_q, _, recon_loss, commit_loss, diversity_loss = self.tokenizer(patches)
+        patches_seq, patch_count = extract_patches(images, self.cfg.patch_size, self.cfg.overlap)
+        recon, z_q, _, recon_loss, commit_loss, diversity_loss = self.tokenizer(patches_seq)
         _ = recon
+        _ = patch_count
 
-        image_repr = z_q.view(images.size(0), patch_count, -1).mean(dim=1)
+        image_repr = z_q.mean(dim=1)
         cls_logits = self.aux_head(image_repr)
 
         if self.task_type == "multiclass":
@@ -461,7 +541,7 @@ class LitVQDistiller(L.LightningModule):
 def export_split_tokens(
     split_name: str,
     loader: DataLoader,
-    tokenizer: PatchVQTokenizer,
+    tokenizer: ContextualPatchTokenizer,
     overlap: float,
     output_dir: Path,
     device: torch.device,
@@ -556,6 +636,11 @@ def train_tokenizer(cfg: DistillConfig):
         "codebook_size": cfg.codebook_size,
         "code_dim": cfg.code_dim,
         "hidden_dim": cfg.hidden_dim,
+        "encoder_layers": cfg.encoder_layers,
+        "decoder_layers": cfg.decoder_layers,
+        "attention_heads": cfg.attention_heads,
+        "ff_mult": cfg.ff_mult,
+        "rvq_stages": cfg.rvq_stages,
         "cls_weight": cfg.cls_weight,
         "cls_weight_end": cfg.cls_weight_end,
         "diversity_weight": cfg.diversity_weight,
@@ -591,6 +676,11 @@ def parse_args():
     parser.add_argument("--codebook-size", type=int, default=2048)
     parser.add_argument("--code-dim", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=384)
+    parser.add_argument("--encoder-layers", type=int, default=3)
+    parser.add_argument("--decoder-layers", type=int, default=2)
+    parser.add_argument("--attention-heads", type=int, default=8)
+    parser.add_argument("--ff-mult", type=int, default=4)
+    parser.add_argument("--rvq-stages", type=int, default=2)
     parser.add_argument("--cls-weight", type=float, default=0.4)
     parser.add_argument("--cls-weight-end", type=float, default=0.2)
     parser.add_argument("--diversity-weight", type=float, default=0.05)
@@ -628,6 +718,11 @@ def main():
         codebook_size=args.codebook_size,
         code_dim=args.code_dim,
         hidden_dim=args.hidden_dim,
+        encoder_layers=args.encoder_layers,
+        decoder_layers=args.decoder_layers,
+        attention_heads=args.attention_heads,
+        ff_mult=args.ff_mult,
+        rvq_stages=args.rvq_stages,
         cls_weight=args.cls_weight,
         cls_weight_end=args.cls_weight_end,
         diversity_weight=args.diversity_weight,
