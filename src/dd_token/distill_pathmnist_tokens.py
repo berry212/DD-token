@@ -1,14 +1,18 @@
 import argparse
 import json
-from dataclasses import dataclass
+import math
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import lightning as L
 import medmnist
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from medmnist import PathMNIST
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -48,6 +52,11 @@ class DistillConfig:
     recon_weight: float = 1.0
     commit_weight: float = 0.25
     cls_weight: float = 0.4
+    cls_weight_end: float = 0.2
+    diversity_weight: float = 0.05
+    quant_temperature: float = 1.0
+    warmup_ratio: float = 0.05
+    min_lr: float = 1e-5
     blur: bool = True
     seed: int = 42
     image_size: int = 256
@@ -55,19 +64,23 @@ class DistillConfig:
     hf_config_name: str = "image-classification"
     hf_trust_remote_code: bool = True
     val_ratio: float = 0.1
+    accelerator: str = "auto"
+    devices: int = 1
+    precision: str = "32"
+    log_every_n_steps: int = 20
 
 
 def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    L.seed_everything(seed, workers=True)
     np.random.seed(seed)
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size: int, code_dim: int, beta: float = 0.25):
+    def __init__(self, codebook_size: int, code_dim: int, beta: float = 0.25, temperature: float = 1.0):
         super().__init__()
         self.codebook = nn.Embedding(codebook_size, code_dim)
         self.beta = beta
+        self.temperature = temperature
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -83,7 +96,14 @@ class VectorQuantizer(nn.Module):
         z_q_st = z_e + (z_q - z_e).detach()
 
         commit_loss = F.mse_loss(z_e, z_q.detach()) + self.beta * F.mse_loss(z_q, z_e.detach())
-        return z_q_st, indices, commit_loss
+
+        soft_assign = F.softmax(-distances / self.temperature, dim=1)
+        avg_probs = soft_assign.mean(dim=0)
+        entropy = -(avg_probs * torch.log(avg_probs + 1e-8)).sum()
+        max_entropy = math.log(self.codebook.num_embeddings)
+        diversity_loss = 1.0 - entropy / max_entropy
+
+        return z_q_st, indices, commit_loss, diversity_loss
 
 
 class PatchVQTokenizer(nn.Module):
@@ -95,6 +115,7 @@ class PatchVQTokenizer(nn.Module):
         code_dim: int,
         codebook_size: int,
         commit_weight: float,
+        quant_temperature: float,
     ):
         super().__init__()
         patch_dim = in_channels * patch_size * patch_size
@@ -104,7 +125,12 @@ class PatchVQTokenizer(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, code_dim),
         )
-        self.quantizer = VectorQuantizer(codebook_size=codebook_size, code_dim=code_dim, beta=commit_weight)
+        self.quantizer = VectorQuantizer(
+            codebook_size=codebook_size,
+            code_dim=code_dim,
+            beta=commit_weight,
+            temperature=quant_temperature,
+        )
         self.decoder = nn.Sequential(
             nn.Linear(code_dim, hidden_dim),
             nn.GELU(),
@@ -114,10 +140,10 @@ class PatchVQTokenizer(nn.Module):
 
     def forward(self, patches: torch.Tensor):
         z_e = self.encoder(patches)
-        z_q_st, indices, commit_loss = self.quantizer(z_e)
+        z_q_st, indices, commit_loss, diversity_loss = self.quantizer(z_e)
         recon = self.decoder(z_q_st)
         recon_loss = F.mse_loss(recon, patches)
-        return recon, z_q_st, indices, recon_loss, commit_loss
+        return recon, z_q_st, indices, recon_loss, commit_loss, diversity_loss
 
     @torch.no_grad()
     def encode_tokens(self, images: torch.Tensor, overlap: float):
@@ -165,9 +191,8 @@ class HFDatasetAdapter(Dataset):
 
     def __getitem__(self, idx):
         row = self.hf_split[idx]
-        image = row["image"]
+        image = row["image"].convert("RGB")
         labels = self._to_multihot(row.get("labels", []))
-        image = image.convert("RGB")
         image = self.transform(image)
         return image, labels
 
@@ -193,30 +218,24 @@ def build_transforms(blur: bool, image_size: int):
     return transforms.Compose(transforms_list)
 
 
-def make_pathmnist_loaders(cfg: DistillConfig):
+def make_pathmnist_datasets(cfg: DistillConfig):
     Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
     transform = build_transforms(cfg.blur, cfg.image_size)
     train_set = PathMNIST(root=cfg.data_root, split="train", transform=transform, download=True)
     val_set = PathMNIST(root=cfg.data_root, split="val", transform=transform, download=True)
     test_set = PathMNIST(root=cfg.data_root, split="test", transform=transform, download=True)
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
-    eval_loader_kwargs = dict(batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
+    num_targets = len(medmnist.INFO["pathmnist"]["label"])
+    label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(num_targets)]
     metadata = {
         "task_type": "multiclass",
-        "num_targets": len(medmnist.INFO["pathmnist"]["label"]),
-        "label_names": [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(len(medmnist.INFO["pathmnist"]["label"]))],
+        "num_targets": num_targets,
+        "label_names": label_names,
     }
-    return train_loader, DataLoader(val_set, **eval_loader_kwargs), DataLoader(test_set, **eval_loader_kwargs), metadata
+    return train_set, val_set, test_set, metadata
 
 
-def make_nih_loaders(cfg: DistillConfig):
+def make_nih_datasets(cfg: DistillConfig):
     transform = build_transforms(cfg.blur, cfg.image_size)
     hf_train = load_dataset(
         cfg.hf_dataset_name,
@@ -236,105 +255,224 @@ def make_nih_loaders(cfg: DistillConfig):
     val_set = HFDatasetAdapter(split_train_val["test"], transform, NIH_14_LABELS)
     test_set = HFDatasetAdapter(hf_test, transform, NIH_14_LABELS)
 
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch_size,
-        shuffle=True,
-        num_workers=cfg.num_workers,
-        pin_memory=True,
-    )
-    eval_loader_kwargs = dict(batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, pin_memory=True)
     metadata = {
         "task_type": "multilabel",
         "num_targets": len(NIH_14_LABELS),
         "label_names": NIH_14_LABELS,
     }
-    return train_loader, DataLoader(val_set, **eval_loader_kwargs), DataLoader(test_set, **eval_loader_kwargs), metadata
+    return train_set, val_set, test_set, metadata
 
 
-def make_loaders(cfg: DistillConfig):
+def make_datasets(cfg: DistillConfig):
     if cfg.dataset == "pathmnist":
-        return make_pathmnist_loaders(cfg)
+        return make_pathmnist_datasets(cfg)
     if cfg.dataset == "nih-chest-xray":
-        return make_nih_loaders(cfg)
+        return make_nih_datasets(cfg)
     raise ValueError(f"Unsupported dataset: {cfg.dataset}")
 
 
-def train_tokenizer(cfg: DistillConfig, device: torch.device):
-    train_loader, val_loader, test_loader, ds_meta = make_loaders(cfg)
-    first_images, _ = next(iter(train_loader))
-    in_channels = int(first_images.size(1))
+class DistillDataModule(L.LightningDataModule):
+    def __init__(self, cfg: DistillConfig):
+        super().__init__()
+        self.cfg = cfg
 
-    model = PatchVQTokenizer(
-        in_channels=in_channels,
-        patch_size=cfg.patch_size,
-        hidden_dim=cfg.hidden_dim,
-        code_dim=cfg.code_dim,
-        codebook_size=cfg.codebook_size,
-        commit_weight=cfg.commit_weight,
-    ).to(device)
+        self.train_set = None
+        self.val_set = None
+        self.test_set = None
 
-    num_targets = ds_meta["num_targets"]
-    aux_head = nn.Linear(cfg.code_dim, num_targets).to(device)
+        self.task_type = "multiclass"
+        self.num_targets = 0
+        self.label_names: list[str] = []
+        self.in_channels = 3
 
-    optimizer = torch.optim.AdamW(list(model.parameters()) + list(aux_head.parameters()), lr=cfg.lr)
-    if ds_meta["task_type"] == "multiclass":
-        cls_criterion = nn.CrossEntropyLoss()
-    else:
-        cls_criterion = nn.BCEWithLogitsLoss()
+    def setup(self, stage: str | None = None):
+        train_set, val_set, test_set, meta = make_datasets(self.cfg)
+        self.train_set = train_set
+        self.val_set = val_set
+        self.test_set = test_set
+        self.task_type = meta["task_type"]
+        self.num_targets = meta["num_targets"]
+        self.label_names = meta["label_names"]
 
-    for epoch in range(cfg.epochs):
-        model.train()
-        total = 0.0
-        steps = 0
+        sample_img, _ = self.train_set[0]
+        self.in_channels = int(sample_img.shape[0])
 
-        for images, labels in train_loader:
-            images = images.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
+    def _loader(self, dataset, shuffle: bool):
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=self.cfg.num_workers > 0,
+        )
 
-            patches, patch_count = extract_patches(images, cfg.patch_size, cfg.overlap)
-            recon, z_q, _, recon_loss, commit_loss = model(patches)
-            _ = recon
+    def train_dataloader(self):
+        return self._loader(self.train_set, shuffle=True)
 
-            image_repr = z_q.view(images.size(0), patch_count, -1).mean(dim=1)
-            cls_logits = aux_head(image_repr)
+    def val_dataloader(self):
+        return self._loader(self.val_set, shuffle=False)
 
-            if ds_meta["task_type"] == "multiclass":
-                cls_loss = cls_criterion(cls_logits, labels.view(-1).long())
-            else:
-                cls_loss = cls_criterion(cls_logits, labels.float())
+    def test_dataloader(self):
+        return self._loader(self.test_set, shuffle=False)
 
-            loss = cfg.recon_weight * recon_loss + commit_loss + cfg.cls_weight * cls_loss
 
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
+class LitVQDistiller(L.LightningModule):
+    def __init__(self, cfg: DistillConfig, in_channels: int, task_type: str, num_targets: int):
+        super().__init__()
+        self.cfg = cfg
+        self.task_type = task_type
 
-            total += float(loss.item())
-            steps += 1
+        self.tokenizer = PatchVQTokenizer(
+            in_channels=in_channels,
+            patch_size=cfg.patch_size,
+            hidden_dim=cfg.hidden_dim,
+            code_dim=cfg.code_dim,
+            codebook_size=cfg.codebook_size,
+            commit_weight=cfg.commit_weight,
+            quant_temperature=cfg.quant_temperature,
+        )
+        self.aux_head = nn.Linear(cfg.code_dim, num_targets)
 
-        avg = total / max(1, steps)
-        print(f"epoch={epoch + 1:02d} train_loss={avg:.6f}")
+        if task_type == "multiclass":
+            self.cls_criterion = nn.CrossEntropyLoss()
+            self.monitor_metric = "val_acc"
+        else:
+            self.cls_criterion = nn.BCEWithLogitsLoss()
+            self.monitor_metric = "val_micro_f1"
 
-    return model, (train_loader, val_loader, test_loader), ds_meta
+        self.val_preds: list[torch.Tensor] = []
+        self.val_targets: list[torch.Tensor] = []
+
+        self.save_hyperparameters(asdict(cfg))
+        self.save_hyperparameters({
+            "in_channels": in_channels,
+            "task_type": task_type,
+            "num_targets": num_targets,
+        })
+
+    def _current_cls_weight(self) -> float:
+        if self.cfg.epochs <= 1:
+            return self.cfg.cls_weight_end
+        ratio = self.current_epoch / float(max(1, self.cfg.epochs - 1))
+        return self.cfg.cls_weight + ratio * (self.cfg.cls_weight_end - self.cfg.cls_weight)
+
+    def _shared_forward(self, images: torch.Tensor, labels: torch.Tensor):
+        patches, patch_count = extract_patches(images, self.cfg.patch_size, self.cfg.overlap)
+        recon, z_q, _, recon_loss, commit_loss, diversity_loss = self.tokenizer(patches)
+        _ = recon
+
+        image_repr = z_q.view(images.size(0), patch_count, -1).mean(dim=1)
+        cls_logits = self.aux_head(image_repr)
+
+        if self.task_type == "multiclass":
+            cls_loss = self.cls_criterion(cls_logits, labels.view(-1).long())
+        else:
+            cls_loss = self.cls_criterion(cls_logits, labels.float())
+
+        cls_weight_now = self._current_cls_weight()
+        total_loss = (
+            self.cfg.recon_weight * recon_loss
+            + commit_loss
+            + cls_weight_now * cls_loss
+            + self.cfg.diversity_weight * diversity_loss
+        )
+        return cls_logits, total_loss, recon_loss, commit_loss, cls_loss, diversity_loss, cls_weight_now
+
+    def training_step(self, batch, batch_idx):
+        images, labels = batch
+        logits, total_loss, recon_loss, commit_loss, cls_loss, diversity_loss, cls_weight_now = self._shared_forward(images, labels)
+        _ = logits
+
+        self.log("train_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log("train_recon_loss", recon_loss, on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log("train_commit_loss", commit_loss, on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log("train_cls_loss", cls_loss, on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log("train_diversity_loss", diversity_loss, on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log("train_cls_weight", cls_weight_now, on_step=False, on_epoch=True, batch_size=images.size(0))
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        images, labels = batch
+        logits, total_loss, _, _, _, _, _ = self._shared_forward(images, labels)
+
+        self.log("val_loss", total_loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=images.size(0))
+
+        if self.task_type == "multiclass":
+            preds = torch.argmax(logits, dim=1)
+            targets = labels.view(-1).long()
+        else:
+            preds = (torch.sigmoid(logits) >= 0.5).long()
+            targets = labels.long()
+
+        self.val_preds.append(preds.detach().cpu())
+        self.val_targets.append(targets.detach().cpu())
+
+    def on_validation_epoch_end(self):
+        if not self.val_preds:
+            return
+
+        y_pred = torch.cat(self.val_preds)
+        y_true = torch.cat(self.val_targets)
+
+        if self.task_type == "multiclass":
+            metric = float((y_pred == y_true).float().mean().item())
+            self.log("val_acc", metric, prog_bar=True, on_step=False, on_epoch=True)
+            self.print(f"epoch={self.current_epoch + 1:02d} val_acc={metric:.4f}")
+        else:
+            tp = torch.sum((y_pred == 1) & (y_true == 1)).item()
+            fp = torch.sum((y_pred == 1) & (y_true == 0)).item()
+            fn = torch.sum((y_pred == 0) & (y_true == 1)).item()
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            metric = (2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+            self.log("val_micro_f1", metric, prog_bar=True, on_step=False, on_epoch=True)
+            self.print(f"epoch={self.current_epoch + 1:02d} val_micro_f1={metric:.4f}")
+
+        self.val_preds.clear()
+        self.val_targets.clear()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr)
+
+        train_loader = self.trainer.datamodule.train_dataloader()
+        total_steps = max(1, self.cfg.epochs * len(train_loader))
+        warmup_steps = int(self.cfg.warmup_ratio * total_steps)
+        min_lr_ratio = self.cfg.min_lr / self.cfg.lr
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
+        }
 
 
 @torch.no_grad()
 def export_split_tokens(
     split_name: str,
     loader: DataLoader,
-    model: PatchVQTokenizer,
+    tokenizer: PatchVQTokenizer,
     overlap: float,
     output_dir: Path,
     device: torch.device,
 ):
-    model.eval()
+    tokenizer.eval()
     all_tokens = []
     all_labels = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
-        tokens = model.encode_tokens(images, overlap=overlap)
+        tokens = tokenizer.encode_tokens(images, overlap=overlap)
         all_tokens.append(tokens.cpu().numpy().astype(np.int32))
 
         labels_np = labels.cpu().numpy()
@@ -352,8 +490,96 @@ def export_split_tokens(
     print(f"saved {split_name}: {output_path} | tokens shape={tokens_np.shape} | labels shape={labels_np.shape}")
 
 
+def train_tokenizer(cfg: DistillConfig):
+    output_dir = Path(cfg.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    dm = DistillDataModule(cfg)
+    dm.setup()
+
+    model = LitVQDistiller(
+        cfg=cfg,
+        in_channels=dm.in_channels,
+        task_type=dm.task_type,
+        num_targets=dm.num_targets,
+    )
+
+    tb_logger = TensorBoardLogger(save_dir=str(output_dir), name="tb_logs")
+    monitor_metric = model.monitor_metric
+
+    ckpt_callback = ModelCheckpoint(
+        dirpath=output_dir / "checkpoints",
+        filename="best-{epoch:02d}-{" + monitor_metric + ":.4f}",
+        monitor=monitor_metric,
+        mode="max",
+        save_top_k=1,
+        save_last=True,
+        save_weights_only=True,
+    )
+    early_stop = EarlyStopping(monitor=monitor_metric, mode="max", patience=max(3, cfg.epochs // 4))
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    trainer = L.Trainer(
+        max_epochs=cfg.epochs,
+        accelerator=cfg.accelerator,
+        devices=cfg.devices,
+        precision=cfg.precision,
+        logger=tb_logger,
+        callbacks=[ckpt_callback, early_stop, lr_monitor],
+        log_every_n_steps=cfg.log_every_n_steps,
+    )
+
+    trainer.fit(model, datamodule=dm)
+
+    best_ckpt = ckpt_callback.best_model_path
+    if best_ckpt:
+        ckpt = torch.load(best_ckpt, map_location="cpu")
+        model.load_state_dict(ckpt["state_dict"], strict=True)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    tokenizer = model.tokenizer
+
+    export_split_tokens("train", dm.train_dataloader(), tokenizer, cfg.overlap, output_dir, device)
+    export_split_tokens("val", dm.val_dataloader(), tokenizer, cfg.overlap, output_dir, device)
+    export_split_tokens("test", dm.test_dataloader(), tokenizer, cfg.overlap, output_dir, device)
+
+    torch.save(tokenizer.state_dict(), output_dir / "vq_tokenizer.pt")
+
+    metadata = {
+        "dataset": cfg.dataset,
+        "task_type": dm.task_type,
+        "num_targets": dm.num_targets,
+        "label_names": dm.label_names,
+        "patch_size": cfg.patch_size,
+        "overlap": cfg.overlap,
+        "codebook_size": cfg.codebook_size,
+        "code_dim": cfg.code_dim,
+        "hidden_dim": cfg.hidden_dim,
+        "cls_weight": cfg.cls_weight,
+        "cls_weight_end": cfg.cls_weight_end,
+        "diversity_weight": cfg.diversity_weight,
+        "quant_temperature": cfg.quant_temperature,
+        "warmup_ratio": cfg.warmup_ratio,
+        "min_lr": cfg.min_lr,
+        "epochs": cfg.epochs,
+        "blur": cfg.blur,
+        "image_size": cfg.image_size,
+        "best_checkpoint": best_ckpt,
+        "best_score": float(ckpt_callback.best_model_score.item()) if ckpt_callback.best_model_score is not None else None,
+        "tensorboard_log_dir": tb_logger.log_dir,
+        "hf_dataset_name": cfg.hf_dataset_name if cfg.dataset == "nih-chest-xray" else None,
+        "hf_config_name": cfg.hf_config_name if cfg.dataset == "nih-chest-xray" else None,
+    }
+    with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
+
+    print(f"saved model + metadata to {output_dir}")
+    print(f"tensorboard logs at {tb_logger.log_dir}")
+
+
 def parse_args():
-    parser = argparse.ArgumentParser(description="Distill image datasets into discrete tokens with a VQ tokenizer.")
+    parser = argparse.ArgumentParser(description="Distill image datasets into discrete tokens with a Lightning VQ tokenizer.")
     parser.add_argument("--dataset", type=str, default="pathmnist", choices=["pathmnist", "nih-chest-xray"])
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default="./artifacts/pathmnist_tokens")
@@ -366,6 +592,11 @@ def parse_args():
     parser.add_argument("--code-dim", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=384)
     parser.add_argument("--cls-weight", type=float, default=0.4)
+    parser.add_argument("--cls-weight-end", type=float, default=0.2)
+    parser.add_argument("--diversity-weight", type=float, default=0.05)
+    parser.add_argument("--quant-temperature", type=float, default=1.0)
+    parser.add_argument("--warmup-ratio", type=float, default=0.05)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--image-size", type=int, default=256)
@@ -375,6 +606,11 @@ def parse_args():
     parser.add_argument("--hf-config-name", type=str, default="image-classification")
     parser.add_argument("--hf-no-trust-remote-code", action="store_true")
     parser.add_argument("--val-ratio", type=float, default=0.1)
+
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--log-every-n-steps", type=int, default=20)
     return parser.parse_args()
 
 
@@ -393,6 +629,11 @@ def main():
         code_dim=args.code_dim,
         hidden_dim=args.hidden_dim,
         cls_weight=args.cls_weight,
+        cls_weight_end=args.cls_weight_end,
+        diversity_weight=args.diversity_weight,
+        quant_temperature=args.quant_temperature,
+        warmup_ratio=args.warmup_ratio,
+        min_lr=args.min_lr,
         num_workers=args.num_workers,
         blur=not args.no_blur,
         image_size=args.image_size,
@@ -401,43 +642,14 @@ def main():
         hf_config_name=args.hf_config_name,
         hf_trust_remote_code=not args.hf_no_trust_remote_code,
         val_ratio=args.val_ratio,
+        accelerator=args.accelerator,
+        devices=args.devices,
+        precision=args.precision,
+        log_every_n_steps=args.log_every_n_steps,
     )
 
     set_seed(cfg.seed)
-    output_dir = Path(cfg.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"device={device}")
-
-    model, loaders, ds_meta = train_tokenizer(cfg, device)
-    train_loader, val_loader, test_loader = loaders
-
-    export_split_tokens("train", train_loader, model, cfg.overlap, output_dir, device)
-    export_split_tokens("val", val_loader, model, cfg.overlap, output_dir, device)
-    export_split_tokens("test", test_loader, model, cfg.overlap, output_dir, device)
-
-    torch.save(model.state_dict(), output_dir / "vq_tokenizer.pt")
-    metadata = {
-        "dataset": cfg.dataset,
-        "task_type": ds_meta["task_type"],
-        "num_targets": ds_meta["num_targets"],
-        "label_names": ds_meta["label_names"],
-        "patch_size": cfg.patch_size,
-        "overlap": cfg.overlap,
-        "codebook_size": cfg.codebook_size,
-        "code_dim": cfg.code_dim,
-        "hidden_dim": cfg.hidden_dim,
-        "cls_weight": cfg.cls_weight,
-        "epochs": cfg.epochs,
-        "blur": cfg.blur,
-        "image_size": cfg.image_size,
-        "hf_dataset_name": cfg.hf_dataset_name if cfg.dataset == "nih-chest-xray" else None,
-        "hf_config_name": cfg.hf_config_name if cfg.dataset == "nih-chest-xray" else None,
-    }
-    with (output_dir / "metadata.json").open("w", encoding="utf-8") as f:
-        json.dump(metadata, f, ensure_ascii=False, indent=2)
-    print(f"saved model + metadata to {output_dir}")
+    train_tokenizer(cfg)
 
 
 if __name__ == "__main__":

@@ -35,6 +35,12 @@ uv run distill-pathmnist-tokens \
   --cls-weight 0.4
 ```
 
+Run TensorBoard for distillation logs:
+
+```bash
+tensorboard --logdir ./artifacts/pathmnist_tokens/tb_logs
+```
+
 Run NIH Chest X-ray distillation (resize to 256x256):
 
 ```bash
