@@ -1,0 +1,1 @@
+uv run distill-pathmnist-tokens --dataset nih-chest-xray --output-dir ./artifacts/nih_tokens_256 --epochs 8 --batch-size 64 --patch-size 8 --overlap 0.2 --codebook-size 2048 --code-dim 256 --hidden-dim 384 --cls-weight 0.4 --image-size 256

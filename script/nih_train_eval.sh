@@ -1,0 +1,1 @@
+uv run train-eval-token-classifier --token-dir ./artifacts/nih_tokens_256 --output-dir ./artifacts/nih_token_classifier --task-type multilabel --threshold 0.5 --epochs 20 --batch-size 256 --lr 3e-4 --d-model 128 --num-layers 4 --ff-dim 256 --dropout 0.1 --warmup-ratio 0.0 --class-balance-power 0.5

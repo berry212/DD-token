@@ -1,6 +1,9 @@
-# DD-token: PathMNIST Token Distillation
+# DD-token: Token Distillation (PathMNIST + NIH Chest X-ray)
 
-This project provides a practical token distillation pipeline for PathMNIST:
+This project provides a practical token distillation pipeline for:
+
+- PathMNIST (multiclass)
+- NIH Chest X-ray (alkzar90/NIH-Chest-X-ray-dataset, 14 disease labels, multilabel)
 
 1. Image preprocessing (normalization + optional denoise)
 2. Overlapping patch extraction
@@ -15,10 +18,11 @@ Install dependencies:
 uv sync
 ```
 
-Run distillation:
+Run PathMNIST distillation:
 
 ```bash
 uv run distill-pathmnist-tokens \
+  --dataset pathmnist \
   --data-root ./data \
   --output-dir ./artifacts/pathmnist_tokens \
   --epochs 16 \
@@ -29,6 +33,40 @@ uv run distill-pathmnist-tokens \
   --code-dim 256 \
   --hidden-dim 384 \
   --cls-weight 0.4
+```
+
+Run NIH Chest X-ray distillation (resize to 256x256):
+
+```bash
+uv run distill-pathmnist-tokens \
+  --dataset nih-chest-xray \
+  --output-dir ./artifacts/nih_tokens_256 \
+  --epochs 8 \
+  --batch-size 64 \
+  --patch-size 8 \
+  --overlap 0.2 \
+  --codebook-size 2048 \
+  --code-dim 256 \
+  --hidden-dim 384 \
+  --cls-weight 0.4 \
+  --image-size 256
+```
+
+Run NIH Chest X-ray distillation without resize (keep original resolution):
+
+```bash
+uv run distill-pathmnist-tokens \
+  --dataset nih-chest-xray \
+  --output-dir ./artifacts/nih_tokens_native \
+  --epochs 8 \
+  --batch-size 16 \
+  --patch-size 8 \
+  --overlap 0.2 \
+  --codebook-size 2048 \
+  --code-dim 256 \
+  --hidden-dim 384 \
+  --cls-weight 0.4 \
+  --image-size 0
 ```
 
 ## Outputs
@@ -44,7 +82,7 @@ The script writes the following files under the output directory:
 Each `*_tokens.npz` contains:
 
 - `tokens`: shape `[N, L]`, where `L` is patch token length per image
-- `labels`: shape `[N]`
+- `labels`: multiclass `[N]` or multilabel `[N, C]`
 
 ## Notes
 
@@ -53,7 +91,9 @@ Each `*_tokens.npz` contains:
 
 ## Train And Evaluate On Distilled Tokens
 
-After token distillation, train and evaluate a token classifier:
+After token distillation, train and evaluate a token classifier.
+
+PathMNIST example:
 
 ```bash
 uv run train-eval-token-classifier \
@@ -71,7 +111,20 @@ uv run train-eval-token-classifier \
   --class-balance-power 0.0
 ```
 
+NIH multilabel example:
+
+```bash
+uv run train-eval-token-classifier \
+  --token-dir ./artifacts/nih_tokens_256 \
+  --output-dir ./artifacts/nih_token_classifier \
+  --task-type multilabel \
+  --threshold 0.5 \
+  --epochs 20 \
+  --batch-size 256 \
+  --lr 3e-4
+```
+
 Outputs:
 
-- `best_token_classifier.pt`: best checkpoint selected by validation accuracy
-- `metrics.json`: training history + final test metrics (`acc`, `macro_f1`, `loss`)
+- `best_token_classifier.pt`: best checkpoint selected by validation metric
+- `metrics.json`: training history + final test metrics

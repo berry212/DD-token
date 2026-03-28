@@ -1,1 +1,1 @@
-uv run distill-pathmnist-tokens --data-root ./data --output-dir ./artifacts/pathmnist_tokens --epochs 16 --batch-size 256 --patch-size 4 --overlap 0.2 --codebook-size 2048 --code-dim 256 --hidden-dim 384 --cls-weight 0.4
+uv run distill-pathmnist-tokens --dataset pathmnist --data-root ./data --output-dir ./artifacts/pathmnist_tokens --epochs 16 --batch-size 256 --patch-size 4 --overlap 0.2 --codebook-size 2048 --code-dim 256 --hidden-dim 384 --cls-weight 0.4 --image-size 28
