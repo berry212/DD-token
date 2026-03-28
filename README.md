@@ -124,7 +124,15 @@ uv run train-eval-token-classifier \
   --lr 3e-4
 ```
 
+Run TensorBoard for training logs:
+
+```bash
+tensorboard --logdir ./artifacts/token_classifier/tb_logs
+```
+
 Outputs:
 
 - `best_token_classifier.pt`: best checkpoint selected by validation metric
-- `metrics.json`: training history + final test metrics
+- `metrics.json`: final test metrics + best checkpoint info + TensorBoard log path
+- `tb_logs/`: TensorBoard event files from Lightning
+- `checkpoints/`: best and last checkpoint from Lightning callbacks

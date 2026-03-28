@@ -4,3 +4,5 @@
 **/*.npz
 **/*.pt
 **/*.json
+logs/
+artifacts/

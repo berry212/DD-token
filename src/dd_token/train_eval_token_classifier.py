@@ -1,12 +1,15 @@
 import argparse
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
+import lightning as L
 import numpy as np
 import torch
 import torch.nn as nn
+from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
+from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler
 
 
@@ -33,11 +36,14 @@ class TrainConfig:
     seed: int = 42
     task_type: str = "auto"
     threshold: float = 0.5
+    accelerator: str = "auto"
+    devices: int = 1
+    precision: str = "32"
+    log_every_n_steps: int = 20
 
 
 def set_seed(seed: int) -> None:
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    L.seed_everything(seed, workers=True)
     np.random.seed(seed)
 
 
@@ -96,50 +102,6 @@ def micro_f1_multilabel(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
     return float(2 * precision * recall / (precision + recall))
 
 
-class TokenClassifier(nn.Module):
-    def __init__(
-        self,
-        vocab_size: int,
-        seq_len: int,
-        num_classes: int,
-        d_model: int,
-        nhead: int,
-        num_layers: int,
-        ff_dim: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, d_model)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
-        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len + 1, d_model))
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=ff_dim,
-            dropout=dropout,
-            activation="gelu",
-            batch_first=True,
-            norm_first=False,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.norm = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, num_classes)
-
-        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
-        nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        x = self.token_emb(tokens)
-        cls = self.cls_token.expand(tokens.size(0), -1, -1)
-        x = torch.cat([cls, x], dim=1)
-        x = x + self.pos_emb
-        x = self.encoder(x)
-        x = self.norm(x)
-        x = x[:, 0]
-        return self.head(x)
-
-
 def build_weighted_sampler(labels: np.ndarray, num_classes: int, balance_power: float) -> WeightedRandomSampler:
     class_counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
     class_counts[class_counts == 0] = 1.0
@@ -189,22 +151,6 @@ def make_loader(
     )
 
 
-def build_warmup_cosine_scheduler(
-    optimizer: torch.optim.Optimizer,
-    total_steps: int,
-    warmup_steps: int,
-    min_lr_ratio: float,
-) -> torch.optim.lr_scheduler.LambdaLR:
-    def lr_lambda(step: int) -> float:
-        if step < warmup_steps:
-            return float(step + 1) / float(max(1, warmup_steps))
-        progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
-        return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
-
-
 def infer_task_type(train_labels: np.ndarray, cfg_task_type: str, token_dir: Path) -> str:
     if cfg_task_type in {"multiclass", "multilabel"}:
         return cfg_task_type
@@ -221,317 +167,502 @@ def infer_task_type(train_labels: np.ndarray, cfg_task_type: str, token_dir: Pat
     return "multiclass"
 
 
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    num_classes: int,
-    task_type: str,
-    threshold: float,
-) -> dict[str, float]:
-    model.eval()
-    total_loss = 0.0
-    count = 0
-    all_preds = []
-    all_labels = []
+class TokenClassifier(nn.Module):
+    def __init__(
+        self,
+        vocab_size: int,
+        seq_len: int,
+        num_classes: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        ff_dim: int,
+        dropout: float,
+    ):
+        super().__init__()
+        self.token_emb = nn.Embedding(vocab_size, d_model)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_emb = nn.Parameter(torch.zeros(1, seq_len + 1, d_model))
 
-    for tokens, labels in loader:
-        tokens = tokens.to(device, non_blocking=True)
-        labels = labels.to(device, non_blocking=True)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=ff_dim,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=False,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, num_classes)
 
-        logits = model(tokens)
-        loss = criterion(logits, labels)
+        nn.init.normal_(self.cls_token, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
 
-        bs = labels.size(0)
-        total_loss += float(loss.item()) * bs
-        count += bs
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        x = self.token_emb(tokens)
+        cls = self.cls_token.expand(tokens.size(0), -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_emb
+        x = self.encoder(x)
+        x = self.norm(x)
+        x = x[:, 0]
+        return self.head(x)
 
-        if task_type == "multiclass":
-            preds = torch.argmax(logits, dim=1)
+
+class TokenDataModule(L.LightningDataModule):
+    def __init__(self, cfg: TrainConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.token_dir = Path(cfg.token_dir)
+
+        self.task_type: str = "multiclass"
+        self.vocab_size: int = 0
+        self.seq_len: int = 0
+        self.num_classes: int = 0
+
+        self.class_weights: torch.Tensor | None = None
+        self.pos_weight: torch.Tensor | None = None
+
+        self.train_loader: DataLoader | None = None
+        self.val_loader: DataLoader | None = None
+        self.test_loader: DataLoader | None = None
+
+    def setup(self, stage: str | None = None):
+        train_tokens, train_labels = load_split(self.token_dir / "train_tokens.npz")
+        val_tokens, val_labels = load_split(self.token_dir / "val_tokens.npz")
+        test_tokens, test_labels = load_split(self.token_dir / "test_tokens.npz")
+
+        self.task_type = infer_task_type(train_labels, self.cfg.task_type, self.token_dir)
+
+        self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
+        self.seq_len = int(train_tokens.shape[1])
+
+        if self.task_type == "multiclass":
+            if train_labels.ndim == 2 and train_labels.shape[1] == 1:
+                train_labels = train_labels.reshape(-1)
+                val_labels = val_labels.reshape(-1)
+                test_labels = test_labels.reshape(-1)
+
+            train_labels = train_labels.astype(np.int64)
+            val_labels = val_labels.astype(np.int64)
+            test_labels = test_labels.astype(np.int64)
+            self.num_classes = int(max(train_labels.max(), val_labels.max(), test_labels.max()) + 1)
+
+            train_sampler = build_weighted_sampler(train_labels, self.num_classes, balance_power=self.cfg.class_balance_power)
+            self.class_weights = build_class_weights_multiclass(
+                train_labels,
+                self.num_classes,
+                balance_power=self.cfg.class_balance_power,
+            )
+
+            self.train_loader = make_loader(
+                train_tokens,
+                train_labels,
+                self.cfg.batch_size,
+                shuffle=True,
+                num_workers=self.cfg.num_workers,
+                sampler=train_sampler,
+                label_dtype=torch.long,
+            )
+            self.val_loader = make_loader(
+                val_tokens,
+                val_labels,
+                self.cfg.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                label_dtype=torch.long,
+            )
+            self.test_loader = make_loader(
+                test_tokens,
+                test_labels,
+                self.cfg.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                label_dtype=torch.long,
+            )
         else:
-            preds = (torch.sigmoid(logits) >= threshold).long()
+            train_labels = train_labels.astype(np.float32)
+            val_labels = val_labels.astype(np.float32)
+            test_labels = test_labels.astype(np.float32)
+            self.num_classes = int(train_labels.shape[1])
+            self.pos_weight = build_pos_weight_multilabel(train_labels, balance_power=self.cfg.class_balance_power)
 
-        all_preds.append(preds)
-        all_labels.append(labels)
+            self.train_loader = make_loader(
+                train_tokens,
+                train_labels,
+                self.cfg.batch_size,
+                shuffle=True,
+                num_workers=self.cfg.num_workers,
+                sampler=None,
+                label_dtype=torch.float32,
+            )
+            self.val_loader = make_loader(
+                val_tokens,
+                val_labels,
+                self.cfg.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                label_dtype=torch.float32,
+            )
+            self.test_loader = make_loader(
+                test_tokens,
+                test_labels,
+                self.cfg.batch_size,
+                shuffle=False,
+                num_workers=self.cfg.num_workers,
+                label_dtype=torch.float32,
+            )
 
-    y_pred = torch.cat(all_preds)
-    y_true = torch.cat(all_labels)
+    def train_dataloader(self) -> DataLoader:
+        if self.train_loader is None:
+            raise RuntimeError("DataModule is not setup yet.")
+        return self.train_loader
 
-    if task_type == "multiclass":
-        acc = float((y_pred == y_true).float().mean().item())
-        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=num_classes)
-        metrics = {
-            "loss": total_loss / max(1, count),
-            "acc": acc,
-            "macro_f1": macro_f1,
+    def val_dataloader(self) -> DataLoader:
+        if self.val_loader is None:
+            raise RuntimeError("DataModule is not setup yet.")
+        return self.val_loader
+
+    def test_dataloader(self) -> DataLoader:
+        if self.test_loader is None:
+            raise RuntimeError("DataModule is not setup yet.")
+        return self.test_loader
+
+
+class LitTokenClassifier(L.LightningModule):
+    def __init__(self, cfg: TrainConfig, dm: TokenDataModule):
+        super().__init__()
+        self.cfg = cfg
+        self.dm = dm
+
+        self.model = TokenClassifier(
+            vocab_size=dm.vocab_size,
+            seq_len=dm.seq_len,
+            num_classes=dm.num_classes,
+            d_model=cfg.d_model,
+            nhead=cfg.nhead,
+            num_layers=cfg.num_layers,
+            ff_dim=cfg.ff_dim,
+            dropout=cfg.dropout,
+        )
+
+        if dm.task_type == "multiclass":
+            weights = dm.class_weights if dm.class_weights is not None else None
+            if weights is not None:
+                weights = weights.clone().detach()
+            self.criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=cfg.label_smoothing)
+            self.monitor_metric = "val_macro_f1"
+        else:
+            pos_weight = dm.pos_weight if dm.pos_weight is not None else None
+            if pos_weight is not None:
+                pos_weight = pos_weight.clone().detach()
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            self.monitor_metric = "val_micro_f1"
+
+        self.val_preds: list[torch.Tensor] = []
+        self.val_targets: list[torch.Tensor] = []
+        self.test_preds: list[torch.Tensor] = []
+        self.test_targets: list[torch.Tensor] = []
+
+        self.save_hyperparameters(asdict(cfg))
+        self.save_hyperparameters({
+            "task_type": dm.task_type,
+            "vocab_size": dm.vocab_size,
+            "seq_len": dm.seq_len,
+            "num_classes": dm.num_classes,
+        })
+
+    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
+        return self.model(tokens)
+
+    @torch.no_grad()
+    def _evaluate_on_loader(self, loader: DataLoader) -> dict[str, float]:
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+        preds_buffer: list[torch.Tensor] = []
+        targets_buffer: list[torch.Tensor] = []
+
+        for tokens, labels in loader:
+            tokens = tokens.to(self.device, non_blocking=True)
+            labels = labels.to(self.device, non_blocking=True)
+
+            logits = self(tokens)
+            loss = self.criterion(logits, labels)
+
+            bs = labels.size(0)
+            total_loss += float(loss.item()) * bs
+            count += bs
+
+            if self.dm.task_type == "multiclass":
+                preds = torch.argmax(logits, dim=1)
+                targets = labels.long()
+            else:
+                preds = (torch.sigmoid(logits) >= self.cfg.threshold).long()
+                targets = labels.long()
+
+            preds_buffer.append(preds.detach().cpu())
+            targets_buffer.append(targets.detach().cpu())
+
+        y_pred = torch.cat(preds_buffer) if preds_buffer else torch.empty(0)
+        y_true = torch.cat(targets_buffer) if targets_buffer else torch.empty(0)
+        metrics = {"loss": total_loss / max(1, count)}
+
+        if y_pred.numel() == 0:
+            return metrics
+
+        if self.dm.task_type == "multiclass":
+            acc = float((y_pred == y_true).float().mean().item())
+            macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
+            metrics.update({"acc": acc, "macro_f1": macro_f1})
+        else:
+            subset_acc = float((y_pred == y_true).all(dim=1).float().mean().item())
+            micro_f1 = micro_f1_multilabel(y_true, y_pred)
+            macro_f1 = macro_f1_multilabel(y_true, y_pred)
+            metrics.update({"subset_acc": subset_acc, "micro_f1": micro_f1, "macro_f1": macro_f1})
+
+        return metrics
+
+    def _shared_step(self, batch, stage: str):
+        tokens, labels = batch
+        logits = self(tokens)
+        loss = self.criterion(logits, labels)
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=tokens.size(0))
+        return logits, labels, loss
+
+    def training_step(self, batch, batch_idx):
+        logits, labels, loss = self._shared_step(batch, stage="train")
+        _ = logits
+        _ = labels
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        logits, labels, loss = self._shared_step(batch, stage="val")
+
+        if self.dm.task_type == "multiclass":
+            preds = torch.argmax(logits, dim=1)
+            targets = labels.long()
+        else:
+            preds = (torch.sigmoid(logits) >= self.cfg.threshold).long()
+            targets = labels.long()
+
+        self.val_preds.append(preds.detach().cpu())
+        self.val_targets.append(targets.detach().cpu())
+        return loss
+
+    def on_validation_epoch_end(self):
+        y_pred = torch.cat(self.val_preds) if self.val_preds else torch.empty(0)
+        y_true = torch.cat(self.val_targets) if self.val_targets else torch.empty(0)
+
+        if y_pred.numel() == 0:
+            return
+
+        if self.dm.task_type == "multiclass":
+            acc = float((y_pred == y_true).float().mean().item())
+            macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
+            self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_macro_f1", macro_f1, prog_bar=True, on_step=False, on_epoch=True)
+        else:
+            subset_acc = float((y_pred == y_true).all(dim=1).float().mean().item())
+            micro_f1 = micro_f1_multilabel(y_true, y_pred)
+            macro_f1 = macro_f1_multilabel(y_true, y_pred)
+            self.log("val_subset_acc", subset_acc, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_micro_f1", micro_f1, prog_bar=True, on_step=False, on_epoch=True)
+            self.log("val_macro_f1", macro_f1, prog_bar=True, on_step=False, on_epoch=True)
+
+        # Record test metrics every epoch for easier debugging curves in TensorBoard.
+        if self.trainer is not None and not self.trainer.sanity_checking:
+            test_metrics = self._evaluate_on_loader(self.dm.test_dataloader())
+            self.log("test_epoch_loss", test_metrics["loss"], prog_bar=False, on_step=False, on_epoch=True)
+            if self.dm.task_type == "multiclass":
+                self.log("test_epoch_acc", test_metrics.get("acc", 0.0), prog_bar=False, on_step=False, on_epoch=True)
+                self.log(
+                    "test_epoch_macro_f1",
+                    test_metrics.get("macro_f1", 0.0),
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.print(
+                    f"epoch_test: loss={test_metrics['loss']:.5f} "
+                    f"acc={test_metrics.get('acc', 0.0):.4f} "
+                    f"macro_f1={test_metrics.get('macro_f1', 0.0):.4f}"
+                )
+            else:
+                self.log(
+                    "test_epoch_subset_acc",
+                    test_metrics.get("subset_acc", 0.0),
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.log(
+                    "test_epoch_micro_f1",
+                    test_metrics.get("micro_f1", 0.0),
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.log(
+                    "test_epoch_macro_f1",
+                    test_metrics.get("macro_f1", 0.0),
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+                self.print(
+                    f"epoch_test: loss={test_metrics['loss']:.5f} "
+                    f"subset_acc={test_metrics.get('subset_acc', 0.0):.4f} "
+                    f"micro_f1={test_metrics.get('micro_f1', 0.0):.4f} "
+                    f"macro_f1={test_metrics.get('macro_f1', 0.0):.4f}"
+                )
+
+        self.val_preds.clear()
+        self.val_targets.clear()
+
+    def test_step(self, batch, batch_idx):
+        logits, labels, loss = self._shared_step(batch, stage="test")
+
+        if self.dm.task_type == "multiclass":
+            preds = torch.argmax(logits, dim=1)
+            targets = labels.long()
+        else:
+            preds = (torch.sigmoid(logits) >= self.cfg.threshold).long()
+            targets = labels.long()
+
+        self.test_preds.append(preds.detach().cpu())
+        self.test_targets.append(targets.detach().cpu())
+        return loss
+
+    def on_test_epoch_end(self):
+        y_pred = torch.cat(self.test_preds) if self.test_preds else torch.empty(0)
+        y_true = torch.cat(self.test_targets) if self.test_targets else torch.empty(0)
+
+        if y_pred.numel() == 0:
+            return
+
+        if self.dm.task_type == "multiclass":
+            acc = float((y_pred == y_true).float().mean().item())
+            macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
+            self.log("test_acc", acc, on_step=False, on_epoch=True)
+            self.log("test_macro_f1", macro_f1, on_step=False, on_epoch=True)
+        else:
+            subset_acc = float((y_pred == y_true).all(dim=1).float().mean().item())
+            micro_f1 = micro_f1_multilabel(y_true, y_pred)
+            macro_f1 = macro_f1_multilabel(y_true, y_pred)
+            self.log("test_subset_acc", subset_acc, on_step=False, on_epoch=True)
+            self.log("test_micro_f1", micro_f1, on_step=False, on_epoch=True)
+            self.log("test_macro_f1", macro_f1, on_step=False, on_epoch=True)
+
+        self.test_preds.clear()
+        self.test_targets.clear()
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+
+        steps_per_epoch = max(1, len(self.dm.train_dataloader()))
+        total_steps = self.cfg.epochs * steps_per_epoch
+        warmup_steps = int(self.cfg.warmup_ratio * total_steps)
+        min_lr_ratio = self.cfg.min_lr / self.cfg.lr
+
+        def lr_lambda(step: int) -> float:
+            if step < warmup_steps:
+                return float(step + 1) / float(max(1, warmup_steps))
+            progress = float(step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+            },
         }
-    else:
-        y_true_i = y_true.long()
-        subset_acc = float((y_pred == y_true_i).all(dim=1).float().mean().item())
-        macro_f1 = macro_f1_multilabel(y_true_i, y_pred)
-        micro_f1 = micro_f1_multilabel(y_true_i, y_pred)
-        metrics = {
-            "loss": total_loss / max(1, count),
-            "subset_acc": subset_acc,
-            "macro_f1": macro_f1,
-            "micro_f1": micro_f1,
-        }
-
-    return metrics
 
 
 def train(cfg: TrainConfig) -> None:
-    token_dir = Path(cfg.token_dir)
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_tokens, train_labels = load_split(token_dir / "train_tokens.npz")
-    val_tokens, val_labels = load_split(token_dir / "val_tokens.npz")
-    test_tokens, test_labels = load_split(token_dir / "test_tokens.npz")
+    dm = TokenDataModule(cfg)
+    dm.setup()
 
-    task_type = infer_task_type(train_labels, cfg.task_type, token_dir)
+    model = LitTokenClassifier(cfg, dm)
 
-    vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
-    seq_len = int(train_tokens.shape[1])
-    if task_type == "multiclass":
-        if train_labels.ndim == 2 and train_labels.shape[1] == 1:
-            train_labels = train_labels.reshape(-1)
-            val_labels = val_labels.reshape(-1)
-            test_labels = test_labels.reshape(-1)
-        train_labels = train_labels.astype(np.int64)
-        val_labels = val_labels.astype(np.int64)
-        test_labels = test_labels.astype(np.int64)
-        num_classes = int(max(train_labels.max(), val_labels.max(), test_labels.max()) + 1)
+    monitor_metric = model.monitor_metric
+    mode = "max"
+
+    tb_logger = TensorBoardLogger(save_dir=str(output_dir), name="tb_logs")
+    ckpt_callback = ModelCheckpoint(
+        dirpath=output_dir / "checkpoints",
+        filename="best-{epoch:02d}-{" + monitor_metric + ":.4f}",
+        monitor=monitor_metric,
+        mode=mode,
+        save_top_k=1,
+        save_last=True,
+    )
+    early_stop = EarlyStopping(monitor=monitor_metric, mode=mode, patience=cfg.early_stop_patience)
+    lr_monitor = LearningRateMonitor(logging_interval="step")
+
+    trainer = L.Trainer(
+        max_epochs=cfg.epochs,
+        accelerator=cfg.accelerator,
+        devices=cfg.devices,
+        precision=cfg.precision,
+        logger=tb_logger,
+        callbacks=[ckpt_callback, early_stop, lr_monitor],
+        gradient_clip_val=cfg.grad_clip_norm,
+        log_every_n_steps=cfg.log_every_n_steps,
+    )
+
+    trainer.fit(model, datamodule=dm)
+
+    best_ckpt = ckpt_callback.best_model_path
+    if best_ckpt:
+        test_results = trainer.test(model=None, datamodule=dm, ckpt_path=best_ckpt)
     else:
-        train_labels = train_labels.astype(np.float32)
-        val_labels = val_labels.astype(np.float32)
-        test_labels = test_labels.astype(np.float32)
-        num_classes = int(train_labels.shape[1])
+        test_results = trainer.test(model=model, datamodule=dm)
 
-    if task_type == "multiclass":
-        train_sampler = build_weighted_sampler(train_labels, num_classes, balance_power=cfg.class_balance_power)
-        train_loader = make_loader(
-            train_tokens,
-            train_labels,
-            cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            sampler=train_sampler,
-            label_dtype=torch.long,
-        )
-        class_weights = build_class_weights_multiclass(train_labels, num_classes, balance_power=cfg.class_balance_power)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=cfg.label_smoothing)
-    else:
-        train_loader = make_loader(
-            train_tokens,
-            train_labels,
-            cfg.batch_size,
-            shuffle=True,
-            num_workers=cfg.num_workers,
-            sampler=None,
-            label_dtype=torch.float32,
-        )
-        pos_weight = build_pos_weight_multilabel(train_labels, balance_power=cfg.class_balance_power)
-        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
-    val_loader = make_loader(
-        val_tokens,
-        val_labels,
-        cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        label_dtype=torch.long if task_type == "multiclass" else torch.float32,
-    )
-    test_loader = make_loader(
-        test_tokens,
-        test_labels,
-        cfg.batch_size,
-        shuffle=False,
-        num_workers=cfg.num_workers,
-        label_dtype=torch.long if task_type == "multiclass" else torch.float32,
-    )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = TokenClassifier(
-        vocab_size=vocab_size,
-        seq_len=seq_len,
-        num_classes=num_classes,
-        d_model=cfg.d_model,
-        nhead=cfg.nhead,
-        num_layers=cfg.num_layers,
-        ff_dim=cfg.ff_dim,
-        dropout=cfg.dropout,
-    ).to(device)
-
-    criterion = criterion.to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-    steps_per_epoch = max(1, len(train_loader))
-    total_steps = cfg.epochs * steps_per_epoch
-    warmup_steps = int(cfg.warmup_ratio * total_steps)
-    min_lr_ratio = cfg.min_lr / cfg.lr
-    scheduler = build_warmup_cosine_scheduler(
-        optimizer=optimizer,
-        total_steps=total_steps,
-        warmup_steps=warmup_steps,
-        min_lr_ratio=min_lr_ratio,
-    )
-
-    best_score = -1.0
-    best_state = None
-    history = []
-    no_improve_epochs = 0
-
-    for epoch in range(cfg.epochs):
-        model.train()
-        running_loss = 0.0
-        seen = 0
-
-        for tokens, labels in train_loader:
-            tokens = tokens.to(device, non_blocking=True)
-            labels = labels.to(device, non_blocking=True)
-
-            logits = model(tokens)
-            loss = criterion(logits, labels)
-
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip_norm)
-            optimizer.step()
-            scheduler.step()
-
-            bs = labels.size(0)
-            running_loss += float(loss.item()) * bs
-            seen += bs
-
-        train_loss = running_loss / max(1, seen)
-        val_metrics = evaluate(
-            model,
-            val_loader,
-            criterion,
-            device,
-            num_classes,
-            task_type=task_type,
-            threshold=cfg.threshold,
-        )
-
-        row = {
-            "epoch": epoch + 1,
-            "train_loss": train_loss,
-            "val_loss": val_metrics["loss"],
-            "lr": optimizer.param_groups[0]["lr"],
-        }
-        row.update({k: v for k, v in val_metrics.items() if k != "loss"})
-        history.append(row)
-
-        if task_type == "multiclass":
-            print(
-                f"epoch={epoch + 1:02d} "
-                f"train_loss={train_loss:.5f} "
-                f"val_loss={val_metrics['loss']:.5f} "
-                f"val_acc={val_metrics['acc']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-                f"lr={optimizer.param_groups[0]['lr']:.6e}"
-            )
-            score = val_metrics["macro_f1"]
-        else:
-            print(
-                f"epoch={epoch + 1:02d} "
-                f"train_loss={train_loss:.5f} "
-                f"val_loss={val_metrics['loss']:.5f} "
-                f"val_subset_acc={val_metrics['subset_acc']:.4f} "
-                f"val_micro_f1={val_metrics['micro_f1']:.4f} "
-                f"val_macro_f1={val_metrics['macro_f1']:.4f} "
-                f"lr={optimizer.param_groups[0]['lr']:.6e}"
-            )
-            score = val_metrics["micro_f1"]
-
-        if score > best_score:
-            best_score = score
-            best_state = {k: v.detach().cpu() for k, v in model.state_dict().items()}
-            no_improve_epochs = 0
-        else:
-            no_improve_epochs += 1
-
-        if no_improve_epochs >= cfg.early_stop_patience:
-            print(f"early_stop at epoch={epoch + 1:02d} (patience={cfg.early_stop_patience})")
-            break
-
-    if best_state is None:
-        raise RuntimeError("Training did not produce a valid checkpoint.")
-
-    model.load_state_dict(best_state)
-    test_metrics = evaluate(
-        model,
-        test_loader,
-        criterion,
-        device,
-        num_classes,
-        task_type=task_type,
-        threshold=cfg.threshold,
-    )
-
-    torch.save(best_state, output_dir / "best_token_classifier.pt")
-
-    result = {
-        "config": {
-            "token_dir": str(token_dir),
-            "task_type": task_type,
-            "threshold": cfg.threshold,
-            "epochs": cfg.epochs,
-            "batch_size": cfg.batch_size,
-            "lr": cfg.lr,
-            "weight_decay": cfg.weight_decay,
-            "d_model": cfg.d_model,
-            "nhead": cfg.nhead,
-            "num_layers": cfg.num_layers,
-            "ff_dim": cfg.ff_dim,
-            "dropout": cfg.dropout,
-            "label_smoothing": cfg.label_smoothing,
-            "warmup_ratio": cfg.warmup_ratio,
-            "min_lr": cfg.min_lr,
-            "grad_clip_norm": cfg.grad_clip_norm,
-            "class_balance_power": cfg.class_balance_power,
-            "early_stop_patience": cfg.early_stop_patience,
-            "num_workers": cfg.num_workers,
-            "seed": cfg.seed,
-        },
+    metrics = {
+        "config": asdict(cfg),
         "dataset": {
-            "vocab_size": vocab_size,
-            "seq_len": seq_len,
-            "num_classes": num_classes,
-            "train_size": int(train_tokens.shape[0]),
-            "val_size": int(val_tokens.shape[0]),
-            "test_size": int(test_tokens.shape[0]),
+            "task_type": dm.task_type,
+            "vocab_size": dm.vocab_size,
+            "seq_len": dm.seq_len,
+            "num_classes": dm.num_classes,
         },
-        "best_score": best_score,
-        "test": test_metrics,
-        "history": history,
+        "best_checkpoint": best_ckpt,
+        "best_score": float(ckpt_callback.best_model_score.item()) if ckpt_callback.best_model_score is not None else None,
+        "test": test_results[0] if test_results else {},
+        "tensorboard_log_dir": tb_logger.log_dir,
     }
 
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
-    if task_type == "multiclass":
+    if dm.task_type == "multiclass":
         print(
-            f"test_loss={test_metrics['loss']:.5f} "
-            f"test_acc={test_metrics['acc']:.4f} "
-            f"test_macro_f1={test_metrics['macro_f1']:.4f}"
+            f"test_loss={metrics['test'].get('test_loss', float('nan')):.5f} "
+            f"test_acc={metrics['test'].get('test_acc', float('nan')):.4f} "
+            f"test_macro_f1={metrics['test'].get('test_macro_f1', float('nan')):.4f}"
         )
     else:
         print(
-            f"test_loss={test_metrics['loss']:.5f} "
-            f"test_subset_acc={test_metrics['subset_acc']:.4f} "
-            f"test_micro_f1={test_metrics['micro_f1']:.4f} "
-            f"test_macro_f1={test_metrics['macro_f1']:.4f}"
+            f"test_loss={metrics['test'].get('test_loss', float('nan')):.5f} "
+            f"test_subset_acc={metrics['test'].get('test_subset_acc', float('nan')):.4f} "
+            f"test_micro_f1={metrics['test'].get('test_micro_f1', float('nan')):.4f} "
+            f"test_macro_f1={metrics['test'].get('test_macro_f1', float('nan')):.4f}"
         )
     print(f"saved model + metrics to {output_dir}")
+    print(f"tensorboard logs at {tb_logger.log_dir}")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train and evaluate a token classifier on distilled tokens.")
+    parser = argparse.ArgumentParser(description="Train and evaluate a token classifier on distilled tokens with Lightning.")
     parser.add_argument("--token-dir", type=str, default="./artifacts/pathmnist_tokens")
     parser.add_argument("--output-dir", type=str, default="./artifacts/token_classifier")
     parser.add_argument("--task-type", type=str, default="auto", choices=["auto", "multiclass", "multilabel"])
@@ -553,6 +684,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--early-stop-patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
+
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=int, default=1)
+    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--log-every-n-steps", type=int, default=20)
     return parser.parse_args()
 
 
@@ -580,6 +716,10 @@ def main() -> None:
         early_stop_patience=args.early_stop_patience,
         num_workers=args.num_workers,
         seed=args.seed,
+        accelerator=args.accelerator,
+        devices=args.devices,
+        precision=args.precision,
+        log_every_n_steps=args.log_every_n_steps,
     )
     set_seed(cfg.seed)
     train(cfg)
