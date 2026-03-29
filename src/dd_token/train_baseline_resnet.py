@@ -8,6 +8,7 @@ import lightning as L
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.utils.data import DataLoader
@@ -33,7 +34,7 @@ class ResNetTrainConfig:
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-2
-    image_size: int = 224
+    image_size: int = 0
     label_smoothing: float = 0.0
     warmup_ratio: float = 0.05
     min_lr: float = 1e-5
@@ -52,6 +53,41 @@ def default_output_dir_for_dataset(dataset: str) -> str:
     if dataset == "skin-lesions":
         return "./artifacts/skin_lesions_resnet_baseline"
     return "./artifacts/pathmnist_resnet_baseline"
+
+
+def collate_pad_variable_images(batch):
+    images = [item[0] for item in batch]
+    labels = torch.tensor([int(item[1]) for item in batch], dtype=torch.long)
+
+    if not images:
+        return torch.empty((0, 0, 0, 0), dtype=torch.float32), labels
+
+    max_h = max(int(img.shape[-2]) for img in images)
+    max_w = max(int(img.shape[-1]) for img in images)
+
+    padded_images = []
+    for image in images:
+        if image.ndim != 3:
+            raise ValueError(f"Expected image tensor [C,H,W], got shape={tuple(image.shape)}")
+        pad_h = max_h - int(image.shape[-2])
+        pad_w = max_w - int(image.shape[-1])
+        padded_images.append(F.pad(image, (0, pad_w, 0, pad_h), mode="constant", value=0.0))
+
+    return torch.stack(padded_images, dim=0), labels
+
+
+class ResNetImageClassificationDataModule(ImageClassificationDataModule):
+    def _loader(self, dataset, shuffle: bool):
+        collate_fn = collate_pad_variable_images if int(self.cfg.image_size) <= 0 else None
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=self.cfg.num_workers > 0,
+            collate_fn=collate_fn,
+        )
 
 
 class LitPathMNISTResNet(L.LightningModule):
@@ -257,7 +293,7 @@ def train(cfg: ResNetTrainConfig) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dm = ImageClassificationDataModule(cfg)
+    dm = ResNetImageClassificationDataModule(cfg)
     dm.setup()
 
     model = LitPathMNISTResNet(cfg=cfg, in_channels=dm.in_channels, num_classes=dm.num_classes)
@@ -350,7 +386,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=0,
+        help="Resize target for input images. Use <=0 to keep original image size (no resize).",
+    )
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr", type=float, default=1e-5)

@@ -12,7 +12,6 @@ case "$DATASET" in
             --epochs 10 \
             --batch-size 256 \
             --model-name resnet18 \
-            --image-size 224 \
             --lr 3e-4 \
             --num-workers 6
         ;;
@@ -24,7 +23,6 @@ case "$DATASET" in
             --epochs 10 \
             --batch-size 128 \
             --model-name resnet18 \
-            --image-size 224 \
             --lr 3e-4 \
             --num-workers 6
         ;;

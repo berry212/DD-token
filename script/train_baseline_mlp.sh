@@ -9,7 +9,6 @@ case "$DATASET" in
             --dataset pathmnist \
             --data-root ./data \
             --output-dir ./artifacts/pathmnist_mlp_baseline \
-            --image-size 64 \
             --hidden-dim 512 \
             --epochs 10 \
             --batch-size 256 \
@@ -21,7 +20,6 @@ case "$DATASET" in
             --dataset skin-lesions \
             --data-root ./data \
             --output-dir ./artifacts/skin_lesions_mlp_baseline \
-            --image-size 64 \
             --hidden-dim 512 \
             --epochs 10 \
             --batch-size 128 \

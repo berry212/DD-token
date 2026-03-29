@@ -27,7 +27,8 @@ class MLPTrainConfig:
     data_root: str
     dataset: str
     output_dir: str
-    image_size: int = 64
+    image_size: int = 0
+    mlp_pool_size: int = 32
     hidden_dim: int = 512
     dropout: float = 0.1
     epochs: int = 20
@@ -54,12 +55,42 @@ def default_output_dir_for_dataset(dataset: str) -> str:
     return "./artifacts/pathmnist_mlp_baseline"
 
 
+def collate_variable_images(batch):
+    images = [item[0] for item in batch]
+    labels = torch.tensor([int(item[1]) for item in batch], dtype=torch.long)
+    return images, labels
+
+
+class MLPImageClassificationDataModule(ImageClassificationDataModule):
+    def _loader(self, dataset, shuffle: bool):
+        collate_fn = collate_variable_images if int(self.cfg.image_size) <= 0 else None
+        return DataLoader(
+            dataset,
+            batch_size=self.cfg.batch_size,
+            shuffle=shuffle,
+            num_workers=self.cfg.num_workers,
+            pin_memory=True,
+            persistent_workers=self.cfg.num_workers > 0,
+            collate_fn=collate_fn,
+        )
+
+
 class ImageMLP(nn.Module):
-    def __init__(self, in_channels: int, image_size: int, num_classes: int, hidden_dim: int, dropout: float):
+    def __init__(
+        self,
+        in_channels: int,
+        pooled_size: int,
+        num_classes: int,
+        hidden_dim: int,
+        dropout: float,
+    ):
         super().__init__()
-        input_dim = int(in_channels * image_size * image_size)
+        if pooled_size <= 0:
+            raise ValueError(f"mlp_pool_size must be > 0, got {pooled_size}.")
+
+        input_dim = int(in_channels * pooled_size * pooled_size)
+        self.pool = nn.AdaptiveAvgPool2d((pooled_size, pooled_size))
         self.net = nn.Sequential(
-            nn.Flatten(),
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
@@ -69,8 +100,20 @@ class ImageMLP(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
 
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
-        return self.net(images)
+    def _forward_tensor(self, images: torch.Tensor) -> torch.Tensor:
+        x = self.pool(images)
+        x = x.flatten(1)
+        return self.net(x)
+
+    def forward(self, images: torch.Tensor | list[torch.Tensor]) -> torch.Tensor:
+        if isinstance(images, list):
+            logits = []
+            for image in images:
+                if image.ndim != 3:
+                    raise ValueError(f"Expected image tensor [C,H,W], got shape={tuple(image.shape)}")
+                logits.append(self._forward_tensor(image.unsqueeze(0)))
+            return torch.cat(logits, dim=0)
+        return self._forward_tensor(images)
 
 
 class LitPathMNISTMLP(L.LightningModule):
@@ -81,7 +124,7 @@ class LitPathMNISTMLP(L.LightningModule):
 
         self.model = ImageMLP(
             in_channels=in_channels,
-            image_size=cfg.image_size,
+            pooled_size=cfg.mlp_pool_size,
             num_classes=num_classes,
             hidden_dim=cfg.hidden_dim,
             dropout=cfg.dropout,
@@ -103,6 +146,12 @@ class LitPathMNISTMLP(L.LightningModule):
         return self.model(images)
 
     @torch.no_grad()
+    def _move_images_to_device(self, images: torch.Tensor | list[torch.Tensor]) -> torch.Tensor | list[torch.Tensor]:
+        if isinstance(images, list):
+            return [img.to(self.device, non_blocking=True) for img in images]
+        return images.to(self.device, non_blocking=True)
+
+    @torch.no_grad()
     def _evaluate_on_loader(self, loader: DataLoader) -> dict[str, float]:
         self.model.eval()
         total_loss = 0.0
@@ -112,7 +161,7 @@ class LitPathMNISTMLP(L.LightningModule):
         probs_buffer: list[torch.Tensor] = []
 
         for images, labels in loader:
-            images = images.to(self.device, non_blocking=True)
+            images = self._move_images_to_device(images)
             labels = labels.view(-1).long().to(self.device, non_blocking=True)
 
             logits = self(images)
@@ -147,15 +196,17 @@ class LitPathMNISTMLP(L.LightningModule):
 
     def _step(self, batch, stage: str):
         images, labels = batch
-        labels = labels.view(-1).long()
+        images = self._move_images_to_device(images)
+        labels = labels.view(-1).long().to(self.device, non_blocking=True)
         logits = self(images)
         loss = self.criterion(logits, labels)
 
         preds = torch.argmax(logits, dim=1)
         acc = float((preds == labels).float().mean().item())
+        batch_size = len(images) if isinstance(images, list) else int(images.size(0))
 
-        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=images.size(0))
-        self.log(f"{stage}_acc", acc, prog_bar=(stage != "train"), on_step=False, on_epoch=True, batch_size=images.size(0))
+        self.log(f"{stage}_loss", loss, prog_bar=True, on_step=False, on_epoch=True, batch_size=batch_size)
+        self.log(f"{stage}_acc", acc, prog_bar=(stage != "train"), on_step=False, on_epoch=True, batch_size=batch_size)
         return logits, labels, loss
 
     def training_step(self, batch, batch_idx):
@@ -277,7 +328,7 @@ def train(cfg: MLPTrainConfig) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dm = ImageClassificationDataModule(cfg)
+    dm = MLPImageClassificationDataModule(cfg)
     dm.setup()
 
     model = LitPathMNISTMLP(cfg=cfg, in_channels=dm.in_channels, num_classes=dm.num_classes)
@@ -365,7 +416,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--image-size", type=int, default=64)
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=0,
+        help="Resize target for input images. Use <=0 to keep original image size (no resize).",
+    )
+    parser.add_argument("--mlp-pool-size", type=int, default=32)
     parser.add_argument("--hidden-dim", type=int, default=512)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--epochs", type=int, default=20)
@@ -398,6 +455,7 @@ def main() -> None:
         dataset=dataset,
         output_dir=output_dir,
         image_size=args.image_size,
+        mlp_pool_size=args.mlp_pool_size,
         hidden_dim=args.hidden_dim,
         dropout=args.dropout,
         epochs=args.epochs,

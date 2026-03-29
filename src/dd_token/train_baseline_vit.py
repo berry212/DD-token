@@ -135,7 +135,10 @@ def format_bytes(num_bytes: int) -> str:
 
 
 def build_train_transform(cfg: ViTTrainConfig):
-    transform_list = [transforms.Resize((cfg.image_size, cfg.image_size), antialias=True)]
+    image_size = int(getattr(cfg, "image_size", 0))
+    transform_list = []
+    if image_size > 0:
+        transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
     if cfg.train_augment:
         transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
     transform_list.extend(
@@ -148,13 +151,17 @@ def build_train_transform(cfg: ViTTrainConfig):
 
 
 def build_eval_transform(cfg: ViTTrainConfig):
-    return transforms.Compose(
+    image_size = int(getattr(cfg, "image_size", 0))
+    transform_list = []
+    if image_size > 0:
+        transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
+    transform_list.extend(
         [
-            transforms.Resize((cfg.image_size, cfg.image_size), antialias=True),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
+    return transforms.Compose(transform_list)
 
 
 class HFParquetImageDataset(Dataset):
