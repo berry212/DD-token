@@ -8,7 +8,7 @@ case "$DATASET" in
         uv run train-eval-token-resnet \
             --dataset pathmnist \
             --token-dir ./artifacts/pathmnist_tokens \
-            --output-dir ./artifacts/token_resnet_classifier \
+            --output-dir ./artifacts/pathmnist_resnet \
             --model-name resnet18 \
             --epochs 10 \
             --batch-size 256 \
@@ -18,7 +18,7 @@ case "$DATASET" in
         uv run train-eval-token-resnet \
             --dataset skin-lesions \
             --token-dir ./artifacts/skin_lesions_tokens \
-            --output-dir ./artifacts/skin_lesions_token_resnet_classifier \
+            --output-dir ./artifacts/skin_lesions_resnet \
             --model-name resnet18 \
             --epochs 10 \
             --batch-size 128 \

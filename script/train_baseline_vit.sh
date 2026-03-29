@@ -8,7 +8,7 @@ case "$DATASET" in
         uv run train-baseline-vit \
             --dataset pathmnist \
             --data-root ./data \
-            --output-dir ./artifacts/pathmnist_vit \
+            --output-dir ./artifacts/pathmnist_vit_baseline \
             --epochs 10 \
             --batch-size 256 \
             --model-name vit_tiny_patch16_224 \
@@ -20,7 +20,7 @@ case "$DATASET" in
         uv run train-baseline-vit \
             --dataset skin-lesions \
             --data-root ./data \
-            --output-dir ./artifacts/skin_lesions_vit \
+            --output-dir ./artifacts/skin_lesions_vit_baseline \
             --epochs 10 \
             --batch-size 128 \
             --model-name vit_tiny_patch16_224 \

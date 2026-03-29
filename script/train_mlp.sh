@@ -8,7 +8,7 @@ case "$DATASET" in
         uv run train-eval-token-mlp \
             --dataset pathmnist \
             --token-dir ./artifacts/pathmnist_tokens \
-            --output-dir ./artifacts/token_mlp_classifier \
+            --output-dir ./artifacts/pathmnist_mlp \
             --embed-dim 128 \
             --hidden-dim 256 \
             --epochs 10 \
@@ -19,7 +19,7 @@ case "$DATASET" in
         uv run train-eval-token-mlp \
             --dataset skin-lesions \
             --token-dir ./artifacts/skin_lesions_tokens \
-            --output-dir ./artifacts/skin_lesions_token_mlp_classifier \
+            --output-dir ./artifacts/skin_lesions_mlp \
             --embed-dim 128 \
             --hidden-dim 256 \
             --epochs 10 \

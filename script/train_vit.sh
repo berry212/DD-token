@@ -8,7 +8,7 @@ case "$DATASET" in
 		uv run train-eval-token-classifier \
 			--dataset pathmnist \
 			--token-dir ./artifacts/pathmnist_tokens \
-			--output-dir ./artifacts/token_vit \
+			--output-dir ./artifacts/pathmnist_vit \
 			--model-name vit_tiny_patch16_224 \
 			--pseudo-image-mode native \
 			--native-patch-size 1 \
@@ -20,7 +20,7 @@ case "$DATASET" in
 		uv run train-eval-token-classifier \
 			--dataset skin-lesions \
 			--token-dir ./artifacts/skin_lesions_tokens \
-			--output-dir ./artifacts/skin_lesions_token_vit \
+			--output-dir ./artifacts/skin_lesions_vit \
 			--model-name vit_tiny_patch16_224 \
 			--pseudo-image-mode native \
 			--native-patch-size 1 \
