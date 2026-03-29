@@ -42,7 +42,6 @@ class DistillConfig:
     batch_size: int = 256
     lr: float = 3e-4
     patch_size: int = 4
-    overlap: float = 0.2
     codebook_size: int = 2048
     code_dim: int = 256
     hidden_dim: int = 384
@@ -244,8 +243,8 @@ class ContextualPatchTokenizer(nn.Module):
         return recon, z_q_seq, indices, recon_loss, commit_loss, diversity_loss
 
     @torch.no_grad()
-    def encode_tokens(self, images: torch.Tensor, overlap: float):
-        patches_seq, _ = extract_patches(images, self.patch_size, overlap)
+    def encode_tokens(self, images: torch.Tensor):
+        patches_seq, _ = extract_patches(images, self.patch_size)
         z_e_seq = self.encode_latents(patches_seq)
         bsz, seq_len, _ = z_e_seq.shape
         z_e_flat = z_e_seq.reshape(-1, z_e_seq.size(-1))
@@ -255,11 +254,8 @@ class ContextualPatchTokenizer(nn.Module):
         return indices.reshape(bsz, -1)
 
 
-def extract_patches(images: torch.Tensor, patch_size: int, overlap: float):
-    if not 0 <= overlap < 1:
-        raise ValueError("overlap must be in [0, 1).")
-
-    stride = max(1, int(round(patch_size * (1.0 - overlap))))
+def extract_patches(images: torch.Tensor, patch_size: int):
+    stride = patch_size
     unfolded = F.unfold(images, kernel_size=patch_size, stride=stride)
     patches = unfolded.transpose(1, 2).contiguous()
     return patches, unfolded.size(-1)
@@ -627,7 +623,7 @@ class LitVQDistiller(L.LightningModule):
         return self.cfg.cls_weight + ratio * (self.cfg.cls_weight_end - self.cfg.cls_weight)
 
     def _shared_forward(self, images: torch.Tensor, labels: torch.Tensor):
-        patches_seq, patch_count = extract_patches(images, self.cfg.patch_size, self.cfg.overlap)
+        patches_seq, patch_count = extract_patches(images, self.cfg.patch_size)
         recon, z_q, _, recon_loss, commit_loss, diversity_loss = self.tokenizer(patches_seq)
         _ = recon
         _ = patch_count
@@ -810,7 +806,6 @@ def export_split_tokens(
     split_name: str,
     loader: DataLoader,
     tokenizer: ContextualPatchTokenizer,
-    overlap: float,
     output_dir: Path,
     device: torch.device,
 ):
@@ -820,7 +815,7 @@ def export_split_tokens(
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
-        tokens = tokenizer.encode_tokens(images, overlap=overlap)
+        tokens = tokenizer.encode_tokens(images)
         all_tokens.append(tokens.cpu().numpy().astype(np.int32))
 
         labels_np = labels.cpu().numpy()
@@ -910,9 +905,9 @@ def train_tokenizer(cfg: DistillConfig):
 
     export_start_time = time.perf_counter()
     token_size_splits = {
-        "train": export_split_tokens("train", dm.train_dataloader(), tokenizer, cfg.overlap, output_dir, device),
-        "val": export_split_tokens("val", dm.val_dataloader(), tokenizer, cfg.overlap, output_dir, device),
-        "test": export_split_tokens("test", dm.test_dataloader(), tokenizer, cfg.overlap, output_dir, device),
+        "train": export_split_tokens("train", dm.train_dataloader(), tokenizer, output_dir, device),
+        "val": export_split_tokens("val", dm.val_dataloader(), tokenizer, output_dir, device),
+        "test": export_split_tokens("test", dm.test_dataloader(), tokenizer, output_dir, device),
     }
     token_export_time_sec = float(time.perf_counter() - export_start_time)
     total_pipeline_time_sec = float(time.perf_counter() - pipeline_start_time)
@@ -927,7 +922,6 @@ def train_tokenizer(cfg: DistillConfig):
         "num_targets": dm.num_targets,
         "label_names": dm.label_names,
         "patch_size": cfg.patch_size,
-        "overlap": cfg.overlap,
         "codebook_size": cfg.codebook_size,
         "code_dim": cfg.code_dim,
         "hidden_dim": cfg.hidden_dim,
@@ -991,7 +985,6 @@ def parse_args():
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--patch-size", type=int, default=4)
-    parser.add_argument("--overlap", type=float, default=0.2)
     parser.add_argument("--codebook-size", type=int, default=2048)
     parser.add_argument("--code-dim", type=int, default=256)
     parser.add_argument("--hidden-dim", type=int, default=384)
@@ -1028,7 +1021,6 @@ def main():
         batch_size=args.batch_size,
         lr=args.lr,
         patch_size=args.patch_size,
-        overlap=args.overlap,
         codebook_size=args.codebook_size,
         code_dim=args.code_dim,
         hidden_dim=args.hidden_dim,

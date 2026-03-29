@@ -7,7 +7,6 @@
 #     --epochs 5 \
 #     --batch-size 256 \
 #     --patch-size 4 \
-#     --overlap 0.2 \
 #     --codebook-size 2048 \
 #     --code-dim 256 \
 #     --hidden-dim 384 \
@@ -26,7 +25,6 @@ uv run distill-pathmnist-tokens --dataset skin-lesions \
     --epochs 5 \
     --batch-size 64 \
     --patch-size 16 \
-    --overlap 0.2 \
     --codebook-size 2048 \
     --code-dim 256 \
     --hidden-dim 384 \
