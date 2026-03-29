@@ -32,7 +32,9 @@ distill-pathmnist-tokens = "dd_token.distill_pathmnist_tokens:main"
 train-eval-token-classifier = "dd_token.train_eval_token_classifier:main"
 train-eval-token-mlp = "dd_token.train_eval_token_mlp:main"
 train-eval-token-resnet = "dd_token.train_eval_token_resnet:main"
-train-pathmnist-vit = "dd_token.train_pathmnist_vit:main"
+train-baseline-vit = "dd_token.train_baseline_vit:main"
+train-baseline-resnet = "dd_token.train_baseline_resnet:main"
+train-baseline-mlp = "dd_token.train_baseline_mlp:main"
 
 [build-system]
 requires = ["hatchling>=1.25.0"]
