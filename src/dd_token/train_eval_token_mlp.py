@@ -682,7 +682,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--class-balance-power", type=float, default=0.0)
     parser.add_argument("--early-stop-patience", type=int, default=10)
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=42)
 
     parser.add_argument("--accelerator", type=str, default="auto")

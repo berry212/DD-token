@@ -23,7 +23,7 @@
 uv run distill-pathmnist-tokens --dataset skin-lesions \
     --data-root ./data \
     --output-dir ./artifacts/skin_lesions_tokens \
-    --epochs 2 \
+    --epochs 5 \
     --batch-size 64 \
     --patch-size 16 \
     --overlap 0.2 \
