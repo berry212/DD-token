@@ -178,15 +178,26 @@ class TokenSequenceDataset(Dataset):
 
 
 class TokenPseudoImageResNet(nn.Module):
-    def __init__(self, model_name: str, vocab_size: int, num_classes: int, image_size: int):
+    def __init__(
+        self,
+        model_name: str,
+        vocab_size: int,
+        num_classes: int,
+        image_size: int,
+        token_format: str,
+        token_channels: int,
+    ):
         super().__init__()
         self.vocab_size = int(vocab_size)
         self.image_size = int(image_size)
+        self.token_format = token_format
+        self.token_channels = int(token_channels)
+        in_chans = self.token_channels if self.token_format == "pseudo_image" else 3
         self.backbone = timm.create_model(
             model_name,
             pretrained=False,
             num_classes=num_classes,
-            in_chans=3,
+            in_chans=in_chans,
         )
 
     def _tokens_to_pseudo_image(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -208,8 +219,24 @@ class TokenPseudoImageResNet(nn.Module):
         x = x.repeat(1, 3, 1, 1)
         return x
 
+    def _stage_indices_to_pseudo_image(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if token_ids.ndim != 4:
+            raise ValueError(f"Expected pseudo-image indices with ndim=4, got shape={tuple(token_ids.shape)}")
+        x = token_ids.float()
+        denom = float(max(1, self.vocab_size - 1))
+        x = x / denom
+
+        if x.shape[-2:] != (self.image_size, self.image_size):
+            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        return x
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        pseudo_img = self._tokens_to_pseudo_image(token_ids)
+        if token_ids.ndim == 2:
+            pseudo_img = self._tokens_to_pseudo_image(token_ids)
+        elif token_ids.ndim == 4:
+            pseudo_img = self._stage_indices_to_pseudo_image(token_ids)
+        else:
+            raise ValueError(f"Unsupported token tensor shape: {tuple(token_ids.shape)}")
         return self.backbone(pseudo_img)
 
 
@@ -300,6 +327,10 @@ class TokenDataModule(L.LightningDataModule):
         self.vocab_size: int = 0
         self.seq_len: int = 0
         self.num_classes: int = 0
+        self.token_format: str = "sequence"
+        self.token_channels: int = 3
+        self.token_grid_h: int = 0
+        self.token_grid_w: int = 0
 
         self.class_weights: torch.Tensor | None = None
         self.token_size_stats: dict | None = None
@@ -317,8 +348,24 @@ class TokenDataModule(L.LightningDataModule):
         val_tokens, val_labels = load_split(val_path)
         test_tokens, test_labels = load_split(test_path)
 
+        if train_tokens.ndim == 2:
+            self.token_format = "sequence"
+            self.seq_len = int(train_tokens.shape[1])
+            self.token_channels = 3
+            self.token_grid_h = 0
+            self.token_grid_w = 0
+        elif train_tokens.ndim == 4:
+            self.token_format = "pseudo_image"
+            self.token_channels = int(train_tokens.shape[1])
+            self.token_grid_h = int(train_tokens.shape[2])
+            self.token_grid_w = int(train_tokens.shape[3])
+            self.seq_len = int(self.token_grid_h * self.token_grid_w)
+        else:
+            raise ValueError(
+                f"Unsupported token tensor rank {train_tokens.ndim}. Expected 2D sequence or 4D pseudo-image tokens."
+            )
+
         self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
-        self.seq_len = int(train_tokens.shape[1])
 
         if train_labels.ndim == 2 and train_labels.shape[1] == 1:
             train_labels = train_labels.reshape(-1)
@@ -405,6 +452,8 @@ class LitTokenResNetClassifier(L.LightningModule):
             vocab_size=dm.vocab_size,
             num_classes=dm.num_classes,
             image_size=cfg.image_size,
+            token_format=dm.token_format,
+            token_channels=dm.token_channels,
         )
 
         weights = dm.class_weights if dm.class_weights is not None else None
@@ -426,6 +475,10 @@ class LitTokenResNetClassifier(L.LightningModule):
                 "vocab_size": dm.vocab_size,
                 "seq_len": dm.seq_len,
                 "num_classes": dm.num_classes,
+                "token_format": dm.token_format,
+                "token_channels": dm.token_channels,
+                "token_grid_h": dm.token_grid_h,
+                "token_grid_w": dm.token_grid_w,
             }
         )
 
@@ -644,6 +697,10 @@ def train(cfg: TrainConfig) -> None:
             "vocab_size": dm.vocab_size,
             "seq_len": dm.seq_len,
             "num_classes": dm.num_classes,
+            "token_format": dm.token_format,
+            "token_channels": dm.token_channels,
+            "token_grid_h": dm.token_grid_h,
+            "token_grid_w": dm.token_grid_w,
         },
         "token_size_stats": dm.token_size_stats,
         "training_profile": profile_summary,

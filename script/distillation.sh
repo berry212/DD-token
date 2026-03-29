@@ -22,9 +22,9 @@
 uv run distill-pathmnist-tokens --dataset skin-lesions \
     --data-root ./data \
     --output-dir ./artifacts/skin_lesions_tokens \
-    --epochs 5 \
+    --epochs 6 \
     --batch-size 64 \
-    --patch-size 16 \
+    --patch-size 32 \
     --codebook-size 2048 \
     --code-dim 256 \
     --hidden-dim 384 \
@@ -35,4 +35,4 @@ uv run distill-pathmnist-tokens --dataset skin-lesions \
     --warmup-ratio 0.05 \
     --min-lr 1e-5 \
     --image-size 256 \
-    --num-workers 0
+    --num-workers 6

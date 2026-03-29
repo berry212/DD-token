@@ -10,6 +10,7 @@ import numpy as np
 import timm
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from sklearn.metrics import roc_auc_score
@@ -22,6 +23,9 @@ class TrainConfig:
     token_dir: str
     output_dir: str
     model_name: str = "vit_tiny_patch16_224"
+    image_size: int = 224
+    pseudo_image_mode: str = "native"
+    native_patch_size: int = 1
     epochs: int = 10
     batch_size: int = 256
     lr: float = 3e-4
@@ -212,6 +216,76 @@ class TokenViTNoPatchEmbed(nn.Module):
         return self.head(x)
 
 
+class TokenPseudoImageViT(nn.Module):
+    def __init__(
+        self,
+        model_name: str,
+        vocab_size: int,
+        num_classes: int,
+        image_size: int,
+        token_channels: int,
+        token_grid_h: int,
+        token_grid_w: int,
+        pseudo_image_mode: str,
+        native_patch_size: int,
+    ):
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.image_size = int(image_size)
+        self.token_channels = int(token_channels)
+        self.token_grid_h = int(token_grid_h)
+        self.token_grid_w = int(token_grid_w)
+        self.pseudo_image_mode = str(pseudo_image_mode)
+        self.native_patch_size = int(native_patch_size)
+
+        if self.pseudo_image_mode not in {"native", "upsample"}:
+            raise ValueError(
+                f"Unsupported pseudo-image mode: {self.pseudo_image_mode}. Use one of: native, upsample."
+            )
+
+        if self.pseudo_image_mode == "native":
+            if self.native_patch_size < 1:
+                raise ValueError("native_patch_size must be >= 1.")
+            if (self.token_grid_h % self.native_patch_size) != 0 or (self.token_grid_w % self.native_patch_size) != 0:
+                raise ValueError(
+                    "native_patch_size must divide both token grid dimensions: "
+                    f"grid=({self.token_grid_h}, {self.token_grid_w}), patch={self.native_patch_size}."
+                )
+            model_img_size: int | tuple[int, int] = (self.token_grid_h, self.token_grid_w)
+            model_patch_size: int = self.native_patch_size
+        else:
+            model_img_size = self.image_size
+            model_patch_size = 16
+
+        self.backbone = timm.create_model(
+            model_name,
+            pretrained=False,
+            num_classes=num_classes,
+            in_chans=self.token_channels,
+            img_size=model_img_size,
+            patch_size=model_patch_size,
+        )
+
+    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        if token_ids.ndim != 4:
+            raise ValueError(f"Expected pseudo-image indices with ndim=4, got shape={tuple(token_ids.shape)}")
+
+        x = token_ids.float()
+        denom = float(max(1, self.vocab_size - 1))
+        x = x / denom
+
+        if self.pseudo_image_mode == "upsample":
+            if x.shape[-2:] != (self.image_size, self.image_size):
+                x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
+        else:
+            expected = (self.token_grid_h, self.token_grid_w)
+            if x.shape[-2:] != expected:
+                raise ValueError(
+                    f"Native pseudo-image mode expects token grid {expected}, got {tuple(x.shape[-2:])}."
+                )
+        return self.backbone(x)
+
+
 class TrainProfileCallback(Callback):
     def __init__(self):
         super().__init__()
@@ -299,6 +373,10 @@ class TokenDataModule(L.LightningDataModule):
         self.vocab_size: int = 0
         self.seq_len: int = 0
         self.num_classes: int = 0
+        self.token_format: str = "sequence"
+        self.token_channels: int = 3
+        self.token_grid_h: int = 0
+        self.token_grid_w: int = 0
 
         self.class_weights: torch.Tensor | None = None
         self.token_size_stats: dict | None = None
@@ -315,8 +393,24 @@ class TokenDataModule(L.LightningDataModule):
         val_tokens, val_labels = load_split(val_path)
         test_tokens, test_labels = load_split(test_path)
 
+        if train_tokens.ndim == 2:
+            self.token_format = "sequence"
+            self.seq_len = int(train_tokens.shape[1])
+            self.token_channels = 3
+            self.token_grid_h = 0
+            self.token_grid_w = 0
+        elif train_tokens.ndim == 4:
+            self.token_format = "pseudo_image"
+            self.token_channels = int(train_tokens.shape[1])
+            self.token_grid_h = int(train_tokens.shape[2])
+            self.token_grid_w = int(train_tokens.shape[3])
+            self.seq_len = int(self.token_grid_h * self.token_grid_w)
+        else:
+            raise ValueError(
+                f"Unsupported token tensor rank {train_tokens.ndim}. Expected 2D sequence or 4D pseudo-image tokens."
+            )
+
         self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
-        self.seq_len = int(train_tokens.shape[1])
 
         if train_labels.ndim == 2 and train_labels.shape[1] == 1:
             train_labels = train_labels.reshape(-1)
@@ -398,12 +492,25 @@ class LitTokenClassifier(L.LightningModule):
         self.cfg = cfg
         self.dm = dm
 
-        self.model = TokenViTNoPatchEmbed(
-            model_name=cfg.model_name,
-            vocab_size=dm.vocab_size,
-            seq_len=dm.seq_len,
-            num_classes=dm.num_classes,
-        )
+        if dm.token_format == "pseudo_image":
+            self.model = TokenPseudoImageViT(
+                model_name=cfg.model_name,
+                vocab_size=dm.vocab_size,
+                num_classes=dm.num_classes,
+                image_size=cfg.image_size,
+                token_channels=dm.token_channels,
+                token_grid_h=dm.token_grid_h,
+                token_grid_w=dm.token_grid_w,
+                pseudo_image_mode=cfg.pseudo_image_mode,
+                native_patch_size=cfg.native_patch_size,
+            )
+        else:
+            self.model = TokenViTNoPatchEmbed(
+                model_name=cfg.model_name,
+                vocab_size=dm.vocab_size,
+                seq_len=dm.seq_len,
+                num_classes=dm.num_classes,
+            )
 
         weights = dm.class_weights if dm.class_weights is not None else None
         if weights is not None:
@@ -423,6 +530,10 @@ class LitTokenClassifier(L.LightningModule):
             "vocab_size": dm.vocab_size,
             "seq_len": dm.seq_len,
             "num_classes": dm.num_classes,
+            "token_format": dm.token_format,
+            "token_channels": dm.token_channels,
+            "token_grid_h": dm.token_grid_h,
+            "token_grid_w": dm.token_grid_w,
         })
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -640,6 +751,10 @@ def train(cfg: TrainConfig) -> None:
             "vocab_size": dm.vocab_size,
             "seq_len": dm.seq_len,
             "num_classes": dm.num_classes,
+            "token_format": dm.token_format,
+            "token_channels": dm.token_channels,
+            "token_grid_h": dm.token_grid_h,
+            "token_grid_w": dm.token_grid_w,
         },
         "token_size_stats": dm.token_size_stats,
         "training_profile": profile_summary,
@@ -682,6 +797,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--model-name", type=str, default="vit_tiny_patch16_224")
+    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument(
+        "--pseudo-image-mode",
+        type=str,
+        default="native",
+        choices=["native", "upsample"],
+        help="For 4D pseudo-image tokens: native keeps token grid size, upsample interpolates to --image-size.",
+    )
+    parser.add_argument(
+        "--native-patch-size",
+        type=int,
+        default=1,
+        help="Patch size used in native pseudo-image mode. Must divide token grid dimensions.",
+    )
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -713,6 +842,9 @@ def main() -> None:
         token_dir=token_dir,
         output_dir=output_dir,
         model_name=args.model_name,
+        image_size=args.image_size,
+        pseudo_image_mode=args.pseudo_image_mode,
+        native_patch_size=args.native_patch_size,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,

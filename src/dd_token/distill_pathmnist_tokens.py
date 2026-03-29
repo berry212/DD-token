@@ -242,23 +242,42 @@ class ContextualPatchTokenizer(nn.Module):
 
         return recon, z_q_seq, indices, recon_loss, commit_loss, diversity_loss
 
+    def _indices_to_pseudo_image(self, indices: torch.Tensor, image_hw: tuple[int, int]) -> torch.Tensor:
+        bsz, seq_len, _ = indices.shape
+        image_h, image_w = image_hw
+        if image_h < self.patch_size or image_w < self.patch_size:
+            raise ValueError(
+                f"image size {(image_h, image_w)} is smaller than patch_size={self.patch_size}."
+            )
+
+        grid_h = (image_h - self.patch_size) // self.patch_size + 1
+        grid_w = (image_w - self.patch_size) // self.patch_size + 1
+        expected_seq_len = grid_h * grid_w
+        if seq_len != expected_seq_len:
+            raise ValueError(
+                f"Patch count mismatch: got seq_len={seq_len}, expected {expected_seq_len} "
+                f"for image {(image_h, image_w)} and patch_size={self.patch_size}."
+            )
+
+        # Keep RVQ stages as channel-like dimensions instead of flattening into sequence.
+        return indices.permute(0, 2, 1).contiguous().view(bsz, self.rvq_stages, grid_h, grid_w)
+
     @torch.no_grad()
     def encode_tokens(self, images: torch.Tensor):
-        patches_seq, _ = extract_patches(images, self.patch_size)
+        patches_seq = extract_patches(images, self.patch_size)
         z_e_seq = self.encode_latents(patches_seq)
-        bsz, seq_len, _ = z_e_seq.shape
         z_e_flat = z_e_seq.reshape(-1, z_e_seq.size(-1))
 
         _, indices_flat, _, _ = self.quantizer(z_e_flat)
-        indices = indices_flat.view(bsz, seq_len, self.rvq_stages)
-        return indices.reshape(bsz, -1)
+        indices = indices_flat.view(z_e_seq.size(0), z_e_seq.size(1), self.rvq_stages)
+        return self._indices_to_pseudo_image(indices, image_hw=(int(images.size(-2)), int(images.size(-1))))
 
 
 def extract_patches(images: torch.Tensor, patch_size: int):
     stride = patch_size
     unfolded = F.unfold(images, kernel_size=patch_size, stride=stride)
     patches = unfolded.transpose(1, 2).contiguous()
-    return patches, unfolded.size(-1)
+    return patches
 
 
 def build_transforms(blur: bool, image_size: int):
@@ -623,10 +642,9 @@ class LitVQDistiller(L.LightningModule):
         return self.cfg.cls_weight + ratio * (self.cfg.cls_weight_end - self.cfg.cls_weight)
 
     def _shared_forward(self, images: torch.Tensor, labels: torch.Tensor):
-        patches_seq, patch_count = extract_patches(images, self.cfg.patch_size)
+        patches_seq = extract_patches(images, self.cfg.patch_size)
         recon, z_q, _, recon_loss, commit_loss, diversity_loss = self.tokenizer(patches_seq)
         _ = recon
-        _ = patch_count
 
         image_repr = z_q.mean(dim=1)
         cls_logits = self.aux_head(image_repr)
@@ -810,13 +828,13 @@ def export_split_tokens(
     device: torch.device,
 ):
     tokenizer.eval()
-    all_tokens = []
+    all_pseudo_tokens = []
     all_labels = []
 
     for images, labels in loader:
         images = images.to(device, non_blocking=True)
-        tokens = tokenizer.encode_tokens(images)
-        all_tokens.append(tokens.cpu().numpy().astype(np.int32))
+        pseudo_tokens = tokenizer.encode_tokens(images)
+        all_pseudo_tokens.append(pseudo_tokens.cpu().numpy().astype(np.int32))
 
         labels_np = labels.cpu().numpy()
         if labels_np.ndim == 1:
@@ -826,11 +844,11 @@ def export_split_tokens(
         else:
             all_labels.append(labels_np.astype(np.float32))
 
-    tokens_np = np.concatenate(all_tokens, axis=0)
+    tokens_np = np.concatenate(all_pseudo_tokens, axis=0)
     labels_np = np.concatenate(all_labels, axis=0)
     output_path = output_dir / f"{split_name}_tokens.npz"
     np.savez_compressed(output_path, tokens=tokens_np, labels=labels_np)
-    print(f"saved {split_name}: {output_path} | tokens shape={tokens_np.shape} | labels shape={labels_np.shape}")
+    print(f"saved {split_name}: {output_path} | pseudo_tokens shape={tokens_np.shape} | labels shape={labels_np.shape}")
 
     raw_tokens_bytes = int(tokens_np.nbytes)
     raw_labels_bytes = int(labels_np.nbytes)
@@ -921,6 +939,7 @@ def train_tokenizer(cfg: DistillConfig):
         "task_type": dm.task_type,
         "num_targets": dm.num_targets,
         "label_names": dm.label_names,
+        "export_token_layout": "[num_samples, rvq_stages, grid_h, grid_w]",
         "patch_size": cfg.patch_size,
         "codebook_size": cfg.codebook_size,
         "code_dim": cfg.code_dim,

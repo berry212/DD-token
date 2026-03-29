@@ -172,6 +172,9 @@ class TokenSequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         token_ids = torch.from_numpy(self.tokens[idx]).to(torch.long)
+        if token_ids.ndim > 1:
+            # Flatten pseudo-image token layout [stage, h, w] to a 1D token sequence for embedding lookup.
+            token_ids = token_ids.reshape(-1)
         label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
         return token_ids, label
 
@@ -283,6 +286,10 @@ class TokenDataModule(L.LightningDataModule):
         self.vocab_size: int = 0
         self.seq_len: int = 0
         self.num_classes: int = 0
+        self.token_format: str = "sequence"
+        self.token_channels: int = 1
+        self.token_grid_h: int = 0
+        self.token_grid_w: int = 0
 
         self.class_weights: torch.Tensor | None = None
         self.token_size_stats: dict | None = None
@@ -300,8 +307,24 @@ class TokenDataModule(L.LightningDataModule):
         val_tokens, val_labels = load_split(val_path)
         test_tokens, test_labels = load_split(test_path)
 
+        if train_tokens.ndim == 2:
+            self.token_format = "sequence"
+            self.seq_len = int(train_tokens.shape[1])
+            self.token_channels = 1
+            self.token_grid_h = 0
+            self.token_grid_w = 0
+        elif train_tokens.ndim == 4:
+            self.token_format = "pseudo_image"
+            self.token_channels = int(train_tokens.shape[1])
+            self.token_grid_h = int(train_tokens.shape[2])
+            self.token_grid_w = int(train_tokens.shape[3])
+            self.seq_len = int(self.token_channels * self.token_grid_h * self.token_grid_w)
+        else:
+            raise ValueError(
+                f"Unsupported token tensor rank {train_tokens.ndim}. Expected 2D sequence or 4D pseudo-image tokens."
+            )
+
         self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
-        self.seq_len = int(train_tokens.shape[1])
 
         if train_labels.ndim == 2 and train_labels.shape[1] == 1:
             train_labels = train_labels.reshape(-1)
@@ -410,6 +433,10 @@ class LitTokenMLPClassifier(L.LightningModule):
                 "vocab_size": dm.vocab_size,
                 "seq_len": dm.seq_len,
                 "num_classes": dm.num_classes,
+                "token_format": dm.token_format,
+                "token_channels": dm.token_channels,
+                "token_grid_h": dm.token_grid_h,
+                "token_grid_w": dm.token_grid_w,
             }
         )
 
@@ -628,6 +655,10 @@ def train(cfg: TrainConfig) -> None:
             "vocab_size": dm.vocab_size,
             "seq_len": dm.seq_len,
             "num_classes": dm.num_classes,
+            "token_format": dm.token_format,
+            "token_channels": dm.token_channels,
+            "token_grid_h": dm.token_grid_h,
+            "token_grid_w": dm.token_grid_w,
         },
         "token_size_stats": dm.token_size_stats,
         "training_profile": profile_summary,
