@@ -23,7 +23,6 @@ class TrainConfig:
     token_dir: str
     output_dir: str
     model_name: str = "resnet18"
-    image_size: int = 224
     epochs: int = 10
     batch_size: int = 256
     lr: float = 3e-4
@@ -89,6 +88,22 @@ def load_split(path: Path) -> tuple[np.ndarray, np.ndarray]:
         tokens = data["tokens"].astype(np.int64)
         labels = data["labels"]
     return tokens, labels
+
+
+def macro_f1_multiclass(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> float:
+    f1_values = []
+    for c in range(num_classes):
+        tp = torch.sum((y_pred == c) & (y_true == c)).item()
+        fp = torch.sum((y_pred == c) & (y_true != c)).item()
+        fn = torch.sum((y_pred != c) & (y_true == c)).item()
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        if precision + recall == 0:
+            f1_values.append(0.0)
+        else:
+            f1_values.append(2 * precision * recall / (precision + recall))
+    return float(sum(f1_values) / len(f1_values))
 
 
 def multiclass_auc_ovr(y_true: torch.Tensor, y_prob: torch.Tensor) -> float | None:
@@ -183,13 +198,11 @@ class TokenPseudoImageResNet(nn.Module):
         model_name: str,
         vocab_size: int,
         num_classes: int,
-        image_size: int,
         token_format: str,
         token_channels: int,
     ):
         super().__init__()
         self.vocab_size = int(vocab_size)
-        self.image_size = int(image_size)
         self.token_format = token_format
         self.token_channels = int(token_channels)
         in_chans = self.token_channels if self.token_format == "pseudo_image" else 3
@@ -213,9 +226,6 @@ class TokenPseudoImageResNet(nn.Module):
         x = x / denom
         x = x.view(batch_size, 1, side, side)
 
-        if side != self.image_size:
-            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
-
         x = x.repeat(1, 3, 1, 1)
         return x
 
@@ -225,9 +235,6 @@ class TokenPseudoImageResNet(nn.Module):
         x = token_ids.float()
         denom = float(max(1, self.vocab_size - 1))
         x = x / denom
-
-        if x.shape[-2:] != (self.image_size, self.image_size):
-            x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
         return x
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
@@ -451,7 +458,6 @@ class LitTokenResNetClassifier(L.LightningModule):
             model_name=cfg.model_name,
             vocab_size=dm.vocab_size,
             num_classes=dm.num_classes,
-            image_size=cfg.image_size,
             token_format=dm.token_format,
             token_channels=dm.token_channels,
         )
@@ -523,9 +529,11 @@ class LitTokenResNetClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         metrics["acc"] = acc
         if auc is not None:
             metrics["auc"] = auc
+        metrics["macro_f1"] = macro_f1
 
         return metrics
 
@@ -564,9 +572,16 @@ class LitTokenResNetClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
         if auc is not None:
             self.log("val_auc", auc, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_macro_f1", macro_f1, prog_bar=True, on_step=False, on_epoch=True)
+        self.print(
+            f"epoch_val: acc={acc:.4f} "
+            f"auc={auc if auc is not None else float('nan'):.4f} "
+            f"macro_f1={macro_f1:.4f}"
+        )
 
         if self.trainer is not None and not self.trainer.sanity_checking:
             test_metrics = self._evaluate_on_loader(self.dm.test_dataloader())
@@ -574,16 +589,20 @@ class LitTokenResNetClassifier(L.LightningModule):
             self.log("test_epoch_acc", test_metrics.get("acc", 0.0), prog_bar=False, on_step=False, on_epoch=True)
             if "auc" in test_metrics:
                 self.log("test_epoch_auc", test_metrics["auc"], prog_bar=False, on_step=False, on_epoch=True)
-                self.print(
-                    f"epoch_test: loss={test_metrics['loss']:.5f} "
-                    f"acc={test_metrics.get('acc', 0.0):.4f} "
-                    f"auc={test_metrics.get('auc', float('nan')):.4f}"
+            if "macro_f1" in test_metrics:
+                self.log(
+                    "test_epoch_macro_f1",
+                    test_metrics["macro_f1"],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
                 )
-            else:
-                self.print(
-                    f"epoch_test: loss={test_metrics['loss']:.5f} "
-                    f"acc={test_metrics.get('acc', 0.0):.4f}"
-                )
+            self.print(
+                f"epoch_test: loss={test_metrics['loss']:.5f} "
+                f"acc={test_metrics.get('acc', float('nan')):.4f} "
+                f"auc={test_metrics.get('auc', float('nan')):.4f} "
+                f"macro_f1={test_metrics.get('macro_f1', float('nan')):.4f}"
+            )
 
         self.val_preds.clear()
         self.val_targets.clear()
@@ -611,9 +630,11 @@ class LitTokenResNetClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         self.log("test_acc", acc, on_step=False, on_epoch=True)
         if auc is not None:
             self.log("test_auc", auc, on_step=False, on_epoch=True)
+        self.log("test_macro_f1", macro_f1, on_step=False, on_epoch=True)
 
         self.test_preds.clear()
         self.test_targets.clear()
@@ -716,7 +737,8 @@ def train(cfg: TrainConfig) -> None:
     print(
         f"test_loss={metrics['test'].get('test_loss', float('nan')):.5f} "
         f"test_acc={metrics['test'].get('test_acc', float('nan')):.4f} "
-        f"test_auc={metrics['test'].get('test_auc', float('nan')):.4f}"
+        f"test_auc={metrics['test'].get('test_auc', float('nan')):.4f} "
+        f"test_macro_f1={metrics['test'].get('test_macro_f1', float('nan')):.4f}"
     )
     total_token_stats = metrics.get("token_size_stats", {}).get("total", {})
     print(
@@ -745,7 +767,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--model-name", type=str, default="resnet18")
-    parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -777,7 +798,6 @@ def main() -> None:
         token_dir=token_dir,
         output_dir=output_dir,
         model_name=args.model_name,
-        image_size=args.image_size,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,

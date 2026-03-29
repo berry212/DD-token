@@ -93,6 +93,22 @@ def load_split(path: Path) -> tuple[np.ndarray, np.ndarray]:
     return tokens, labels
 
 
+def macro_f1_multiclass(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> float:
+    f1_values = []
+    for c in range(num_classes):
+        tp = torch.sum((y_pred == c) & (y_true == c)).item()
+        fp = torch.sum((y_pred == c) & (y_true != c)).item()
+        fn = torch.sum((y_pred != c) & (y_true == c)).item()
+
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+        recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+        if precision + recall == 0:
+            f1_values.append(0.0)
+        else:
+            f1_values.append(2 * precision * recall / (precision + recall))
+    return float(sum(f1_values) / len(f1_values))
+
+
 def multiclass_auc_ovr(y_true: torch.Tensor, y_prob: torch.Tensor) -> float | None:
     if y_true.numel() == 0 or y_prob.numel() == 0:
         return None
@@ -577,9 +593,11 @@ class LitTokenClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         metrics["acc"] = acc
         if auc is not None:
             metrics["auc"] = auc
+        metrics["macro_f1"] = macro_f1
 
         return metrics
 
@@ -618,9 +636,16 @@ class LitTokenClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
         if auc is not None:
             self.log("val_auc", auc, prog_bar=True, on_step=False, on_epoch=True)
+        self.log("val_macro_f1", macro_f1, prog_bar=True, on_step=False, on_epoch=True)
+        self.print(
+            f"epoch_val: acc={acc:.4f} "
+            f"auc={auc if auc is not None else float('nan'):.4f} "
+            f"macro_f1={macro_f1:.4f}"
+        )
 
         if self.trainer is not None and not self.trainer.sanity_checking:
             test_metrics = self._evaluate_on_loader(self.dm.test_dataloader())
@@ -628,16 +653,20 @@ class LitTokenClassifier(L.LightningModule):
             self.log("test_epoch_acc", test_metrics.get("acc", 0.0), prog_bar=False, on_step=False, on_epoch=True)
             if "auc" in test_metrics:
                 self.log("test_epoch_auc", test_metrics["auc"], prog_bar=False, on_step=False, on_epoch=True)
-                self.print(
-                    f"epoch_test: loss={test_metrics['loss']:.5f} "
-                    f"acc={test_metrics.get('acc', 0.0):.4f} "
-                    f"auc={test_metrics.get('auc', float('nan')):.4f}"
+            if "macro_f1" in test_metrics:
+                self.log(
+                    "test_epoch_macro_f1",
+                    test_metrics["macro_f1"],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
                 )
-            else:
-                self.print(
-                    f"epoch_test: loss={test_metrics['loss']:.5f} "
-                    f"acc={test_metrics.get('acc', 0.0):.4f}"
-                )
+            self.print(
+                f"epoch_test: loss={test_metrics['loss']:.5f} "
+                f"acc={test_metrics.get('acc', float('nan')):.4f} "
+                f"auc={test_metrics.get('auc', float('nan')):.4f} "
+                f"macro_f1={test_metrics.get('macro_f1', float('nan')):.4f}"
+            )
 
         self.val_preds.clear()
         self.val_targets.clear()
@@ -665,9 +694,11 @@ class LitTokenClassifier(L.LightningModule):
 
         acc = float((y_pred == y_true).float().mean().item())
         auc = multiclass_auc_ovr(y_true, y_prob)
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.dm.num_classes)
         self.log("test_acc", acc, on_step=False, on_epoch=True)
         if auc is not None:
             self.log("test_auc", auc, on_step=False, on_epoch=True)
+        self.log("test_macro_f1", macro_f1, on_step=False, on_epoch=True)
 
         self.test_preds.clear()
         self.test_targets.clear()
@@ -770,7 +801,8 @@ def train(cfg: TrainConfig) -> None:
     print(
         f"test_loss={metrics['test'].get('test_loss', float('nan')):.5f} "
         f"test_acc={metrics['test'].get('test_acc', float('nan')):.4f} "
-        f"test_auc={metrics['test'].get('test_auc', float('nan')):.4f}"
+        f"test_auc={metrics['test'].get('test_auc', float('nan')):.4f} "
+        f"test_macro_f1={metrics['test'].get('test_macro_f1', float('nan')):.4f}"
     )
     total_token_stats = metrics.get("token_size_stats", {}).get("total", {})
     print(

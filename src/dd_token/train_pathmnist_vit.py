@@ -433,6 +433,49 @@ class LitPathMNISTViT(L.LightningModule):
     def forward(self, images: torch.Tensor) -> torch.Tensor:
         return self.model(images)
 
+    @torch.no_grad()
+    def _evaluate_on_loader(self, loader: DataLoader) -> dict[str, float]:
+        self.model.eval()
+        total_loss = 0.0
+        count = 0
+        preds_buffer: list[torch.Tensor] = []
+        targets_buffer: list[torch.Tensor] = []
+        probs_buffer: list[torch.Tensor] = []
+
+        for images, labels in loader:
+            images = images.to(self.device, non_blocking=True)
+            labels = labels.view(-1).long().to(self.device, non_blocking=True)
+
+            logits = self(images)
+            loss = self.criterion(logits, labels)
+
+            bs = labels.size(0)
+            total_loss += float(loss.item()) * bs
+            count += bs
+
+            preds = torch.argmax(logits, dim=1)
+            probs = torch.softmax(logits, dim=1)
+            preds_buffer.append(preds.detach().cpu())
+            targets_buffer.append(labels.detach().cpu())
+            probs_buffer.append(probs.detach().cpu())
+
+        y_pred = torch.cat(preds_buffer) if preds_buffer else torch.empty(0)
+        y_true = torch.cat(targets_buffer) if targets_buffer else torch.empty(0)
+        y_prob = torch.cat(probs_buffer) if probs_buffer else torch.empty(0)
+
+        metrics = {"loss": total_loss / max(1, count)}
+        if y_pred.numel() == 0:
+            return metrics
+
+        acc = float((y_pred == y_true).float().mean().item())
+        macro_f1 = macro_f1_multiclass(y_true, y_pred, num_classes=self.num_classes)
+        auc = multiclass_auc_ovr(y_true, y_prob)
+        metrics["acc"] = acc
+        metrics["macro_f1"] = macro_f1
+        if auc is not None:
+            metrics["auc"] = auc
+        return metrics
+
     def _step(self, batch, stage: str):
         images, labels = batch
         labels = labels.view(-1).long()
@@ -476,6 +519,32 @@ class LitPathMNISTViT(L.LightningModule):
         if auc is not None:
             self.log("val_auc", auc, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_macro_f1", macro_f1, prog_bar=True, on_step=False, on_epoch=True)
+        self.print(
+            f"epoch_val: acc={acc:.4f} "
+            f"auc={auc if auc is not None else float('nan'):.4f} "
+            f"macro_f1={macro_f1:.4f}"
+        )
+
+        if self.trainer is not None and not self.trainer.sanity_checking and self.trainer.datamodule is not None:
+            test_metrics = self._evaluate_on_loader(self.trainer.datamodule.test_dataloader())
+            self.log("test_epoch_loss", test_metrics["loss"], prog_bar=False, on_step=False, on_epoch=True)
+            self.log("test_epoch_acc", test_metrics.get("acc", 0.0), prog_bar=False, on_step=False, on_epoch=True)
+            if "auc" in test_metrics:
+                self.log("test_epoch_auc", test_metrics["auc"], prog_bar=False, on_step=False, on_epoch=True)
+            if "macro_f1" in test_metrics:
+                self.log(
+                    "test_epoch_macro_f1",
+                    test_metrics["macro_f1"],
+                    prog_bar=False,
+                    on_step=False,
+                    on_epoch=True,
+                )
+            self.print(
+                f"epoch_test: loss={test_metrics['loss']:.5f} "
+                f"acc={test_metrics.get('acc', float('nan')):.4f} "
+                f"auc={test_metrics.get('auc', float('nan')):.4f} "
+                f"macro_f1={test_metrics.get('macro_f1', float('nan')):.4f}"
+            )
 
         self.val_preds.clear()
         self.val_targets.clear()
