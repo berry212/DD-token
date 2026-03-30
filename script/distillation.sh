@@ -1,17 +1,13 @@
 #!/usr/bin/env bash
 # set -euo pipefail
 
-# python distill_pathmnist_tokens.py --dataset pathmnist --output-dir ./artifacts/pathmnist_tokens --encode-batch-size 8 --rvq-stages 2
 
 uv run distill-pathmnist-tokens --dataset pathmnist \
     --data-root ./data \
     --output-dir ./artifacts/pathmnist_tokens \
     --epochs 5 \
     --batch-size 256 \
-    --patch-size 4 \
-    --codebook-size 2048 \
-    --code-dim 256 \
-    --hidden-dim 384 \
+    --rvq-stages 2 \
     --cls-weight 0.5 \
     --cls-weight-end 0.2 \
     --diversity-weight 0.05 \
@@ -26,10 +22,7 @@ uv run distill-pathmnist-tokens --dataset pathmnist \
 #     --output-dir ./artifacts/skin_lesions_tokens \
 #     --epochs 6 \
 #     --batch-size 64 \
-#     --patch-size 32 \
-#     --codebook-size 2048 \
-#     --code-dim 256 \
-#     --hidden-dim 384 \
+#     --rvq-stages 2 \
 #     --cls-weight 0.4 \
 #     --cls-weight-end 0.2 \
 #     --diversity-weight 0.05 \
