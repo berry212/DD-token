@@ -23,11 +23,12 @@ class TrainConfig:
     token_dir: str
     output_dir: str
     model_name: str = "vit_tiny_patch16_224"
+    pretrained_backbone: bool = True
+    freeze_encoder: bool = True
+    max_seq_len: int = 1024
     image_size: int = 224
-    pseudo_image_mode: str = "native"
-    native_patch_size: int = 1
     epochs: int = 10
-    batch_size: int = 256
+    batch_size: int = 96
     lr: float = 3e-4
     weight_decay: float = 1e-2
     label_smoothing: float = 0.0
@@ -91,6 +92,14 @@ def load_split(path: Path) -> tuple[np.ndarray, np.ndarray]:
         tokens = data["tokens"].astype(np.int64)
         labels = data["labels"]
     return tokens, labels
+
+
+def flatten_tokens_to_sequence(tokens: np.ndarray) -> np.ndarray:
+    if tokens.ndim == 2:
+        return tokens
+    if tokens.ndim == 4:
+        return tokens.reshape(tokens.shape[0], -1)
+    raise ValueError(f"Unsupported token tensor rank {tokens.ndim}. Expected 2D or 4D tokens.")
 
 
 def macro_f1_multiclass(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> float:
@@ -196,17 +205,39 @@ class TokenSequenceDataset(Dataset):
 
 
 class TokenViTNoPatchEmbed(nn.Module):
-    def __init__(self, model_name: str, vocab_size: int, seq_len: int, num_classes: int):
+    def __init__(
+        self,
+        model_name: str,
+        vocab_size: int,
+        seq_len: int,
+        num_classes: int,
+        pretrained: bool,
+        freeze_encoder: bool,
+        max_seq_len: int,
+    ):
         super().__init__()
-        vit = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+        vit = timm.create_model(model_name, pretrained=pretrained, num_classes=num_classes)
 
         self.embed_dim = int(vit.embed_dim)
         self.num_prefix_tokens = int(getattr(vit, "num_prefix_tokens", 1))
+        self.max_seq_len = int(max(1, max_seq_len))
 
         self.token_emb = nn.Embedding(vocab_size, self.embed_dim)
-        self.cls_token = nn.Parameter(vit.cls_token.detach().clone())
-        self.pos_embed = nn.Parameter(torch.zeros(1, seq_len + self.num_prefix_tokens, self.embed_dim))
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        nn.init.trunc_normal_(self.token_emb.weight, std=0.02)
+
+        cls_token = getattr(vit, "cls_token", None)
+        if cls_token is None:
+            cls_token = torch.zeros(1, 1, self.embed_dim)
+            nn.init.trunc_normal_(cls_token, std=0.02)
+        self.cls_token = nn.Parameter(cls_token.detach().clone())
+
+        source_pos_embed = getattr(vit, "pos_embed", None)
+        if source_pos_embed is not None and isinstance(source_pos_embed, torch.Tensor):
+            resized_pos_embed = self._resize_pos_embed(source_pos_embed.detach(), seq_len)
+        else:
+            resized_pos_embed = torch.zeros(1, seq_len + self.num_prefix_tokens, self.embed_dim)
+            nn.init.trunc_normal_(resized_pos_embed, std=0.02)
+        self.pos_embed = nn.Parameter(resized_pos_embed)
 
         self.pos_drop = vit.pos_drop
         self.blocks = vit.blocks
@@ -215,11 +246,53 @@ class TokenViTNoPatchEmbed(nn.Module):
         self.head_drop = vit.head_drop if hasattr(vit, "head_drop") else nn.Identity()
         self.head = vit.head
 
+        if freeze_encoder:
+            for module in [self.blocks, self.norm]:
+                for param in module.parameters():
+                    param.requires_grad = False
+
+    def _resize_pos_embed(self, pos_embed: torch.Tensor, target_seq_len: int) -> torch.Tensor:
+        if pos_embed.ndim != 3:
+            raise ValueError(f"Expected pos_embed shape [1, tokens, dim], got {tuple(pos_embed.shape)}")
+
+        prefix = pos_embed[:, : self.num_prefix_tokens]
+        body = pos_embed[:, self.num_prefix_tokens :]
+        if body.size(1) == target_seq_len:
+            resized_body = body
+        else:
+            resized_body = F.interpolate(
+                body.transpose(1, 2),
+                size=target_seq_len,
+                mode="linear",
+                align_corners=False,
+            ).transpose(1, 2)
+        return torch.cat([prefix, resized_body], dim=1)
+
+    def _maybe_subsample_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
+        seq_len = int(token_ids.size(1))
+        if seq_len <= self.max_seq_len:
+            return token_ids
+
+        index = torch.linspace(
+            0,
+            seq_len - 1,
+            steps=self.max_seq_len,
+            device=token_ids.device,
+        ).round().long()
+        return token_ids.index_select(1, index)
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
+        token_ids = self._maybe_subsample_tokens(token_ids)
         x = self.token_emb(token_ids)
         cls = self.cls_token.expand(token_ids.size(0), -1, -1)
         x = torch.cat([cls, x], dim=1)
-        x = x + self.pos_embed[:, : x.size(1)]
+
+        if self.pos_embed.size(1) < x.size(1):
+            resized_pos = self._resize_pos_embed(self.pos_embed, target_seq_len=x.size(1) - self.num_prefix_tokens)
+            x = x + resized_pos[:, : x.size(1)]
+        else:
+            x = x + self.pos_embed[:, : x.size(1)]
+
         x = self.pos_drop(x)
 
         for blk in self.blocks:
@@ -230,76 +303,6 @@ class TokenViTNoPatchEmbed(nn.Module):
         x = self.fc_norm(x)
         x = self.head_drop(x)
         return self.head(x)
-
-
-class TokenPseudoImageViT(nn.Module):
-    def __init__(
-        self,
-        model_name: str,
-        vocab_size: int,
-        num_classes: int,
-        image_size: int,
-        token_channels: int,
-        token_grid_h: int,
-        token_grid_w: int,
-        pseudo_image_mode: str,
-        native_patch_size: int,
-    ):
-        super().__init__()
-        self.vocab_size = int(vocab_size)
-        self.image_size = int(image_size)
-        self.token_channels = int(token_channels)
-        self.token_grid_h = int(token_grid_h)
-        self.token_grid_w = int(token_grid_w)
-        self.pseudo_image_mode = str(pseudo_image_mode)
-        self.native_patch_size = int(native_patch_size)
-
-        if self.pseudo_image_mode not in {"native", "upsample"}:
-            raise ValueError(
-                f"Unsupported pseudo-image mode: {self.pseudo_image_mode}. Use one of: native, upsample."
-            )
-
-        if self.pseudo_image_mode == "native":
-            if self.native_patch_size < 1:
-                raise ValueError("native_patch_size must be >= 1.")
-            if (self.token_grid_h % self.native_patch_size) != 0 or (self.token_grid_w % self.native_patch_size) != 0:
-                raise ValueError(
-                    "native_patch_size must divide both token grid dimensions: "
-                    f"grid=({self.token_grid_h}, {self.token_grid_w}), patch={self.native_patch_size}."
-                )
-            model_img_size: int | tuple[int, int] = (self.token_grid_h, self.token_grid_w)
-            model_patch_size: int = self.native_patch_size
-        else:
-            model_img_size = self.image_size
-            model_patch_size = 16
-
-        self.backbone = timm.create_model(
-            model_name,
-            pretrained=False,
-            num_classes=num_classes,
-            in_chans=self.token_channels,
-            img_size=model_img_size,
-            patch_size=model_patch_size,
-        )
-
-    def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        if token_ids.ndim != 4:
-            raise ValueError(f"Expected pseudo-image indices with ndim=4, got shape={tuple(token_ids.shape)}")
-
-        x = token_ids.float()
-        denom = float(max(1, self.vocab_size - 1))
-        x = x / denom
-
-        if self.pseudo_image_mode == "upsample":
-            if x.shape[-2:] != (self.image_size, self.image_size):
-                x = F.interpolate(x, size=(self.image_size, self.image_size), mode="bilinear", align_corners=False)
-        else:
-            expected = (self.token_grid_h, self.token_grid_w)
-            if x.shape[-2:] != expected:
-                raise ValueError(
-                    f"Native pseudo-image mode expects token grid {expected}, got {tuple(x.shape[-2:])}."
-                )
-        return self.backbone(x)
 
 
 class TrainProfileCallback(Callback):
@@ -411,20 +414,23 @@ class TokenDataModule(L.LightningDataModule):
 
         if train_tokens.ndim == 2:
             self.token_format = "sequence"
-            self.seq_len = int(train_tokens.shape[1])
-            self.token_channels = 3
+            self.token_channels = 1
             self.token_grid_h = 0
             self.token_grid_w = 0
         elif train_tokens.ndim == 4:
-            self.token_format = "pseudo_image"
+            self.token_format = "sequence"
             self.token_channels = int(train_tokens.shape[1])
             self.token_grid_h = int(train_tokens.shape[2])
             self.token_grid_w = int(train_tokens.shape[3])
-            self.seq_len = int(self.token_grid_h * self.token_grid_w)
         else:
             raise ValueError(
                 f"Unsupported token tensor rank {train_tokens.ndim}. Expected 2D sequence or 4D pseudo-image tokens."
             )
+
+        train_tokens_flat = flatten_tokens_to_sequence(train_tokens)
+        val_tokens_flat = flatten_tokens_to_sequence(val_tokens)
+        test_tokens_flat = flatten_tokens_to_sequence(test_tokens)
+        self.seq_len = int(train_tokens_flat.shape[1])
 
         self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
 
@@ -462,9 +468,9 @@ class TokenDataModule(L.LightningDataModule):
             },
         }
 
-        train_dataset = TokenSequenceDataset(train_tokens, train_labels)
-        val_dataset = TokenSequenceDataset(val_tokens, val_labels)
-        test_dataset = TokenSequenceDataset(test_tokens, test_labels)
+        train_dataset = TokenSequenceDataset(train_tokens_flat, train_labels)
+        val_dataset = TokenSequenceDataset(val_tokens_flat, val_labels)
+        test_dataset = TokenSequenceDataset(test_tokens_flat, test_labels)
 
         self.train_loader = make_loader(
             train_dataset,
@@ -508,25 +514,15 @@ class LitTokenClassifier(L.LightningModule):
         self.cfg = cfg
         self.dm = dm
 
-        if dm.token_format == "pseudo_image":
-            self.model = TokenPseudoImageViT(
-                model_name=cfg.model_name,
-                vocab_size=dm.vocab_size,
-                num_classes=dm.num_classes,
-                image_size=cfg.image_size,
-                token_channels=dm.token_channels,
-                token_grid_h=dm.token_grid_h,
-                token_grid_w=dm.token_grid_w,
-                pseudo_image_mode=cfg.pseudo_image_mode,
-                native_patch_size=cfg.native_patch_size,
-            )
-        else:
-            self.model = TokenViTNoPatchEmbed(
-                model_name=cfg.model_name,
-                vocab_size=dm.vocab_size,
-                seq_len=dm.seq_len,
-                num_classes=dm.num_classes,
-            )
+        self.model = TokenViTNoPatchEmbed(
+            model_name=cfg.model_name,
+            vocab_size=dm.vocab_size,
+            seq_len=dm.seq_len,
+            num_classes=dm.num_classes,
+            pretrained=cfg.pretrained_backbone,
+            freeze_encoder=cfg.freeze_encoder,
+            max_seq_len=cfg.max_seq_len,
+        )
 
         weights = dm.class_weights if dm.class_weights is not None else None
         if weights is not None:
@@ -705,7 +701,10 @@ class LitTokenClassifier(L.LightningModule):
         self.test_probs.clear()
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        trainable_params = [p for p in self.parameters() if p.requires_grad]
+        if not trainable_params:
+            raise RuntimeError("No trainable parameters found. Check freeze settings.")
+        optimizer = torch.optim.AdamW(trainable_params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         steps_per_epoch = max(1, len(self.dm.train_dataloader()))
         total_steps = self.cfg.epochs * steps_per_epoch
@@ -829,22 +828,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--token-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
     parser.add_argument("--model-name", type=str, default="vit_tiny_patch16_224")
-    parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument(
-        "--pseudo-image-mode",
-        type=str,
-        default="native",
-        choices=["native", "upsample"],
-        help="For 4D pseudo-image tokens: native keeps token grid size, upsample interpolates to --image-size.",
+        "--no-pretrained-backbone",
+        dest="pretrained_backbone",
+        action="store_false",
+        help="Disable ImageNet pretrained weights for ViT backbone.",
     )
+    parser.set_defaults(pretrained_backbone=True)
     parser.add_argument(
-        "--native-patch-size",
+        "--unfreeze-encoder",
+        dest="freeze_encoder",
+        action="store_false",
+        help="Train the full ViT encoder instead of freezing it.",
+    )
+    parser.set_defaults(freeze_encoder=True)
+    parser.add_argument(
+        "--max-seq-len",
         type=int,
-        default=1,
-        help="Patch size used in native pseudo-image mode. Must divide token grid dimensions.",
+        default=1024,
+        help="Upper bound for token sequence length. Longer sequences are uniformly subsampled for VRAM safety.",
     )
+    parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
@@ -874,9 +880,10 @@ def main() -> None:
         token_dir=token_dir,
         output_dir=output_dir,
         model_name=args.model_name,
+        pretrained_backbone=args.pretrained_backbone,
+        freeze_encoder=args.freeze_encoder,
+        max_seq_len=args.max_seq_len,
         image_size=args.image_size,
-        pseudo_image_mode=args.pseudo_image_mode,
-        native_patch_size=args.native_patch_size,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,

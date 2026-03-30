@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # set -euo pipefail
 
+# python distill_pathmnist_tokens.py --dataset pathmnist --output-dir ./artifacts/pathmnist_tokens --encode-batch-size 8 --rvq-stages 2
+
 uv run distill-pathmnist-tokens --dataset pathmnist \
     --data-root ./data \
     --output-dir ./artifacts/pathmnist_tokens \
