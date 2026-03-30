@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
-from medmnist import PathMNIST
+from medmnist import DermaMNIST, PathMNIST
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -35,7 +35,12 @@ _SKIN_LESIONS_ALIASES = {
     "skin_lesions",
     "skin-lesions-classification",
 }
-SUPPORTED_DATASET_CHOICES = ["pathmnist", "skin-lesions", HF_SKIN_LESIONS_REPO_ID]
+_DERMAMNIST_ALIASES = {
+    "dermamnist",
+    "derma",
+    "dermamnist+",
+}
+SUPPORTED_DATASET_CHOICES = ["pathmnist", "dermamnist", "skin-lesions", HF_SKIN_LESIONS_REPO_ID]
 
 
 @dataclass
@@ -261,9 +266,9 @@ class PretrainedRVQTokenizer(nn.Module):
         return indices
 
 
-def build_transforms(blur: bool, image_size: int):
+def build_transforms(blur: bool, image_size: int, enable_resize: bool = True):
     transforms_list = []
-    if image_size > 0:
+    if enable_resize and image_size > 0:
         transforms_list.append(transforms.Resize((image_size, image_size)))
     transforms_list.append(transforms.ToTensor())
     if blur:
@@ -386,22 +391,90 @@ class HFParquetImageDataset(Dataset):
 
 
 def make_pathmnist_datasets(cfg: DistillConfig):
-    Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
-    transform = build_transforms(cfg.blur, cfg.image_size)
-    train_set = PathMNIST(root=cfg.data_root, split="train", transform=transform, download=True)
-    val_set = PathMNIST(root=cfg.data_root, split="val", transform=transform, download=True)
-    test_set = PathMNIST(root=cfg.data_root, split="test", transform=transform, download=True)
+    return make_medmnist_multiclass_datasets(
+        cfg,
+        dataset_key="pathmnist",
+        dataset_cls=PathMNIST,
+        require_native_size=False,
+    )
 
-    num_targets = len(medmnist.INFO["pathmnist"]["label"])
-    label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(num_targets)]
+
+def _build_medmnist_split(
+    dataset_cls,
+    cfg: DistillConfig,
+    split: str,
+    transform,
+    require_native_size: bool = False,
+):
+    base_kwargs = {
+        "root": cfg.data_root,
+        "split": split,
+        "transform": transform,
+        "download": True,
+    }
+    try:
+        return dataset_cls(size=cfg.image_size, **base_kwargs)
+    except TypeError as exc:
+        if require_native_size:
+            raise RuntimeError(
+                "DermaMNIST official high-resolution split requires medmnist with `size` support. "
+                "Please upgrade medmnist (e.g., `uv add -U medmnist`) and retry."
+            ) from exc
+        return dataset_cls(**base_kwargs)
+
+
+def make_medmnist_multiclass_datasets(
+    cfg: DistillConfig,
+    dataset_key: str,
+    dataset_cls,
+    require_native_size: bool,
+):
+    Path(cfg.data_root).mkdir(parents=True, exist_ok=True)
+    # DermaMNIST official 224 should come from MedMNIST+ native split, not transform resize.
+    transform = build_transforms(cfg.blur, cfg.image_size, enable_resize=not require_native_size)
+    train_set = _build_medmnist_split(
+        dataset_cls,
+        cfg,
+        split="train",
+        transform=transform,
+        require_native_size=require_native_size,
+    )
+    val_set = _build_medmnist_split(
+        dataset_cls,
+        cfg,
+        split="val",
+        transform=transform,
+        require_native_size=require_native_size,
+    )
+    test_set = _build_medmnist_split(
+        dataset_cls,
+        cfg,
+        split="test",
+        transform=transform,
+        require_native_size=require_native_size,
+    )
+
+    num_targets = len(medmnist.INFO[dataset_key]["label"])
+    label_names = [medmnist.INFO[dataset_key]["label"][str(i)] for i in range(num_targets)]
     metadata = {"task_type": "multiclass", "num_targets": num_targets, "label_names": label_names}
     return train_set, val_set, test_set, metadata
+
+
+def make_dermamnist_datasets(cfg: DistillConfig):
+    return make_medmnist_multiclass_datasets(
+        cfg,
+        dataset_key="dermamnist",
+        dataset_cls=DermaMNIST,
+        require_native_size=True,
+    )
 
 
 def _dataset_name_kind(dataset_name: str) -> str:
     normalized = dataset_name.strip().lower()
     if normalized == "pathmnist":
         return "pathmnist"
+    if normalized in _DERMAMNIST_ALIASES:
+        return "dermamnist"
     if normalized in {name.lower() for name in _SKIN_LESIONS_ALIASES}:
         return "hf_skin_lesions"
     raise ValueError(
@@ -526,6 +599,8 @@ def make_datasets(cfg: DistillConfig):
     kind = _dataset_name_kind(cfg.dataset)
     if kind == "pathmnist":
         return make_pathmnist_datasets(cfg)
+    if kind == "dermamnist":
+        return make_dermamnist_datasets(cfg)
     if kind == "hf_skin_lesions":
         return make_hf_skin_lesions_datasets(cfg)
     raise ValueError(f"Unsupported dataset kind: {kind}")
