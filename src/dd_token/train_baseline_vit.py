@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
-from medmnist import PathMNIST
+from medmnist import DermaMNIST, PathMNIST
 from PIL import Image
 from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, Dataset
@@ -48,6 +48,8 @@ class ViTTrainConfig:
 
 
 HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
+_DERMAMNIST_ALIASES = {"dermamnist", "derma", "dermamnist+"}
+DERMAMNIST_NATIVE_SIZE = 244
 PRETRAINED_VIT_BACKBONE = "vit_base_patch16_224"
 BACKBONE_IMAGE_SIZE = 224
 
@@ -56,10 +58,12 @@ def normalize_dataset_name(dataset: str) -> str:
     normalized = dataset.strip().lower()
     if normalized == "pathmnist":
         return "pathmnist"
+    if normalized in _DERMAMNIST_ALIASES:
+        return "dermamnist"
     if normalized in {"skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID.lower()}:
         return "skin-lesions"
     raise ValueError(
-        "Unsupported dataset name. Supported values: pathmnist, skin-lesions, "
+        "Unsupported dataset name. Supported values: pathmnist, dermamnist, skin-lesions, "
         f"{HF_SKIN_LESIONS_REPO_ID}."
     )
 
@@ -67,6 +71,8 @@ def normalize_dataset_name(dataset: str) -> str:
 def default_output_dir_for_dataset(dataset: str) -> str:
     if dataset == "skin-lesions":
         return "./artifacts/skin_lesions_vit"
+    if dataset == "dermamnist":
+        return "./artifacts/dermamnist_vit_baseline"
     return "./artifacts/pathmnist_vit"
 
 
@@ -330,6 +336,37 @@ class ImageClassificationDataModule(L.LightningDataModule):
             self.test_set = PathMNIST(root=self.cfg.data_root, split="test", transform=eval_transform, download=True)
             self.num_classes = len(medmnist.INFO["pathmnist"]["label"])
             self.label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(self.num_classes)]
+        elif self.cfg.dataset == "dermamnist":
+            try:
+                self.train_set = DermaMNIST(
+                    root=self.cfg.data_root,
+                    split="train",
+                    transform=train_transform,
+                    download=True,
+                    size=DERMAMNIST_NATIVE_SIZE,
+                )
+                self.val_set = DermaMNIST(
+                    root=self.cfg.data_root,
+                    split="val",
+                    transform=eval_transform,
+                    download=True,
+                    size=DERMAMNIST_NATIVE_SIZE,
+                )
+                self.test_set = DermaMNIST(
+                    root=self.cfg.data_root,
+                    split="test",
+                    transform=eval_transform,
+                    download=True,
+                    size=DERMAMNIST_NATIVE_SIZE,
+                )
+            except TypeError as exc:
+                raise RuntimeError(
+                    "Current medmnist does not support DermaMNIST `size` argument. "
+                    "Please upgrade medmnist (e.g., `uv add -U medmnist`)."
+                ) from exc
+
+            self.num_classes = len(medmnist.INFO["dermamnist"]["label"])
+            self.label_names = [medmnist.INFO["dermamnist"]["label"][str(i)] for i in range(self.num_classes)]
         else:
             snapshot_dir = Path(
                 snapshot_download(
@@ -753,7 +790,16 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="pathmnist",
-        choices=["pathmnist", "skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID],
+        choices=[
+            "pathmnist",
+            "dermamnist",
+            "derma",
+            "dermamnist+",
+            "skin-lesions",
+            "skin_lesions",
+            "skin-lesions-classification",
+            HF_SKIN_LESIONS_REPO_ID,
+        ],
     )
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default=None)

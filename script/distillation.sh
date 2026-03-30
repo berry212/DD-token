@@ -7,8 +7,8 @@ uv run distill-pathmnist-tokens --dataset dermamnist \
     --data-root ./data \
     --output-dir ./artifacts/dermamnist_tokens \
     --epochs 5 \
-    --batch-size 64 \
-    --rvq-stages 2 \
+    --batch-size 16 \
+    --rvq-stages 1 \
     --cls-weight 0.8 \
     --cls-weight-end 0.5 \
     --diversity-weight 0.05 \
@@ -23,7 +23,7 @@ uv run distill-pathmnist-tokens --dataset dermamnist \
 #     --output-dir ./artifacts/pathmnist_tokens \
 #     --epochs 5 \
 #     --batch-size 256 \
-#     --rvq-stages 2 \
+#     --rvq-stages 1 \
 #     --cls-weight 0.8 \
 #     --cls-weight-end 0.5 \
 #     --diversity-weight 0.05 \
@@ -38,7 +38,7 @@ uv run distill-pathmnist-tokens --dataset dermamnist \
 #     --output-dir ./artifacts/skin_lesions_tokens \
 #     --epochs 6 \
 #     --batch-size 64 \
-#     --rvq-stages 2 \
+#     --rvq-stages 1 \
 #     --cls-weight 0.4 \
 #     --cls-weight-end 0.2 \
 #     --diversity-weight 0.05 \

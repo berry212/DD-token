@@ -46,27 +46,34 @@ class TrainConfig:
 
 
 HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
+_DERMAMNIST_ALIASES = {"dermamnist", "derma", "dermamnist+"}
 
 
 def normalize_dataset_name(dataset: str) -> str:
     normalized = dataset.strip().lower()
     if normalized == "pathmnist":
         return "pathmnist"
+    if normalized in _DERMAMNIST_ALIASES:
+        return "dermamnist"
     if normalized in {"skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID.lower()}:
         return "skin-lesions"
     raise ValueError(
-        "Unsupported dataset name. Supported values: pathmnist, skin-lesions, "
+        "Unsupported dataset name. Supported values: pathmnist, dermamnist, skin-lesions, "
         f"{HF_SKIN_LESIONS_REPO_ID}."
     )
 
 
 def default_token_dir_for_dataset(dataset: str) -> str:
+    if dataset == "dermamnist":
+        return "./artifacts/dermamnist_tokens"
     if dataset == "skin-lesions":
         return "./artifacts/skin_lesions_tokens"
     return "./artifacts/pathmnist_tokens"
 
 
 def default_output_dir_for_dataset(dataset: str) -> str:
+    if dataset == "dermamnist":
+        return "./artifacts/dermamnist_vit"
     if dataset == "skin-lesions":
         return "./artifacts/skin_lesions_token_classifier"
     return "./artifacts/token_classifier"
@@ -823,7 +830,16 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="pathmnist",
-        choices=["pathmnist", "skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID],
+        choices=[
+            "pathmnist",
+            "dermamnist",
+            "derma",
+            "dermamnist+",
+            "skin-lesions",
+            "skin_lesions",
+            "skin-lesions-classification",
+            HF_SKIN_LESIONS_REPO_ID,
+        ],
     )
     parser.add_argument("--token-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
