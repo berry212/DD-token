@@ -41,7 +41,7 @@ class TrainConfig:
     seed: int = 42
     accelerator: str = "auto"
     devices: int = 1
-    precision: str = "32"
+    precision: str = "bf16-mixed"
     log_every_n_steps: int = 20
 
 
@@ -864,7 +864,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--log-every-n-steps", type=int, default=20)
     return parser.parse_args()
 

@@ -47,7 +47,7 @@ class DistillConfig:
     vqvae_subfolder: str | None = "vqvae"
     vqvae_revision: str | None = None
     encode_batch_size: int = 8
-    quantize_chunk_size: int = 4096
+    quantize_chunk_size: int = 2048
     epochs: int = 12
     batch_size: int = 128
     lr: float = 3e-4
@@ -66,7 +66,7 @@ class DistillConfig:
     image_size: int = 128
     accelerator: str = "auto"
     devices: int = 1
-    precision: str = "32"
+    precision: str = "bf16-mixed"
     log_every_n_steps: int = 20
 
 
@@ -1031,7 +1031,7 @@ def parse_args():
     parser.add_argument("--vqvae-subfolder", type=str, default="vqvae")
     parser.add_argument("--vqvae-revision", type=str, default=None)
     parser.add_argument("--encode-batch-size", type=int, default=8)
-    parser.add_argument("--quantize-chunk-size", type=int, default=4096)
+    parser.add_argument("--quantize-chunk-size", type=int, default=2048)
     parser.add_argument("--epochs", type=int, default=12)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -1049,7 +1049,7 @@ def parse_args():
 
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--log-every-n-steps", type=int, default=20)
     return parser.parse_args()
 

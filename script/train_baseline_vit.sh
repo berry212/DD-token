@@ -11,10 +11,9 @@ case "$DATASET" in
             --output-dir ./artifacts/pathmnist_vit_baseline \
             --epochs 10 \
             --batch-size 256 \
-            --model-name vit_tiny_patch16_224 \
-            --image-size 224 \
             --lr 3e-4 \
-            --num-workers 6
+            --num-workers 6 \
+            --precision bf16-mixed
         ;;
     skin-lesions|skin_lesions|ahmed-ai/skin-lesions-classification-dataset)
         uv run train-baseline-vit \
@@ -23,10 +22,9 @@ case "$DATASET" in
             --output-dir ./artifacts/skin_lesions_vit_baseline \
             --epochs 10 \
             --batch-size 128 \
-            --model-name vit_tiny_patch16_224 \
-            --image-size 224 \
             --lr 3e-4 \
-            --num-workers 6
+            --num-workers 6 \
+            --precision bf16-mixed
         ;;
     *)
         echo "Usage: sh script/train_baseline_vit.sh [pathmnist|skin-lesions]" >&2

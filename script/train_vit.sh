@@ -10,8 +10,6 @@ case "$DATASET" in
 			--token-dir ./artifacts/pathmnist_tokens \
 			--output-dir ./artifacts/pathmnist_vit \
 			--model-name vit_tiny_patch16_224 \
-			--pseudo-image-mode native \
-			--native-patch-size 1 \
 			--epochs 10 \
 			--batch-size 256 \
 			--lr 3e-4
@@ -22,8 +20,6 @@ case "$DATASET" in
 			--token-dir ./artifacts/skin_lesions_tokens \
 			--output-dir ./artifacts/skin_lesions_vit \
 			--model-name vit_tiny_patch16_224 \
-			--pseudo-image-mode native \
-			--native-patch-size 1 \
 			--epochs 10 \
 			--batch-size 128 \
 			--lr 3e-4

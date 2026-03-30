@@ -29,12 +29,10 @@ class ViTTrainConfig:
     data_root: str
     dataset: str
     output_dir: str
-    model_name: str = "vit_tiny_patch16_224"
     epochs: int = 20
     batch_size: int = 256
     lr: float = 3e-4
     weight_decay: float = 1e-2
-    image_size: int = 224
     label_smoothing: float = 0.0
     warmup_ratio: float = 0.05
     min_lr: float = 1e-5
@@ -45,11 +43,13 @@ class ViTTrainConfig:
     seed: int = 42
     accelerator: str = "auto"
     devices: int = 1
-    precision: str = "32"
+    precision: str = "bf16-mixed"
     log_every_n_steps: int = 20
 
 
 HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
+PRETRAINED_VIT_BACKBONE = "vit_base_patch16_224"
+BACKBONE_IMAGE_SIZE = 224
 
 
 def normalize_dataset_name(dataset: str) -> str:
@@ -115,27 +115,8 @@ def multiclass_auc_ovr(y_true: torch.Tensor, y_prob: torch.Tensor) -> float | No
     return float(auc)
 
 
-def scalar_bytes_from_precision(precision: str) -> int:
-    normalized = precision.lower()
-    if "bf16" in normalized:
-        return 2
-    if "16" in normalized:
-        return 2
-    return 4
-
-
-def format_bytes(num_bytes: int) -> str:
-    if num_bytes < 1024:
-        return f"{num_bytes} B"
-    if num_bytes < 1024**2:
-        return f"{num_bytes / 1024.0:.2f} KB"
-    if num_bytes < 1024**3:
-        return f"{num_bytes / (1024.0**2):.2f} MB"
-    return f"{num_bytes / (1024.0**3):.2f} GB"
-
-
 def build_train_transform(cfg: ViTTrainConfig):
-    image_size = int(getattr(cfg, "image_size", 0))
+    image_size = BACKBONE_IMAGE_SIZE
     transform_list = []
     if image_size > 0:
         transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
@@ -151,7 +132,7 @@ def build_train_transform(cfg: ViTTrainConfig):
 
 
 def build_eval_transform(cfg: ViTTrainConfig):
-    image_size = int(getattr(cfg, "image_size", 0))
+    image_size = BACKBONE_IMAGE_SIZE
     transform_list = []
     if image_size > 0:
         transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
@@ -397,33 +378,26 @@ class ImageClassificationDataModule(L.LightningDataModule):
         return self._loader(self.test_set, shuffle=False)
 
 
-def _as_square_patch_size(model: nn.Module) -> int:
-    patch = getattr(model.patch_embed, "patch_size", 16)
-    if isinstance(patch, tuple):
-        if len(patch) != 2 or patch[0] != patch[1]:
-            raise ValueError(f"Only square patch size is supported, got {patch}.")
-        return int(patch[0])
-    return int(patch)
-
-
 class LitPathMNISTViT(L.LightningModule):
     def __init__(self, cfg: ViTTrainConfig, in_channels: int, num_classes: int):
         super().__init__()
         self.cfg = cfg
         self.num_classes = num_classes
 
+        if in_channels != 3:
+            raise ValueError(
+                f"{PRETRAINED_VIT_BACKBONE} pretrained weights require RGB in_channels=3, got {in_channels}."
+            )
+
         self.model = timm.create_model(
-            cfg.model_name,
-            pretrained=False,
+            PRETRAINED_VIT_BACKBONE,
+            pretrained=True,
             num_classes=num_classes,
-            in_chans=in_channels,
-            img_size=cfg.image_size,
+            in_chans=3,
+            img_size=BACKBONE_IMAGE_SIZE,
         )
         for param in self.model.parameters():
             param.requires_grad = True
-        self.patch_size = _as_square_patch_size(self.model)
-        self.embed_dim = int(getattr(self.model, "embed_dim"))
-        self.num_prefix_tokens = int(getattr(self.model, "num_prefix_tokens", 1))
         self.criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
         self.monitor_metric = "val_acc"
 
@@ -689,79 +663,6 @@ class TrainProfileCallback(Callback):
         return out
 
 
-def estimate_token_stats(cfg: ViTTrainConfig, dm: ImageClassificationDataModule, model: LitPathMNISTViT) -> dict:
-    patch_size = model.patch_size
-    embed_dim = model.embed_dim
-    num_prefix_tokens = model.num_prefix_tokens
-
-    if cfg.image_size % patch_size != 0:
-        raise ValueError("image_size must be divisible by patch_size.")
-
-    num_patch_tokens = (cfg.image_size // patch_size) ** 2
-    seq_len_with_cls = num_patch_tokens + num_prefix_tokens
-    raw_patch_dim = dm.in_channels * patch_size * patch_size
-
-    scalar_bytes = scalar_bytes_from_precision(cfg.precision)
-    scalar_dtype = "fp16/bf16" if scalar_bytes == 2 else "fp32"
-
-    raw_patch_token_bytes = raw_patch_dim * scalar_bytes
-    embed_token_bytes = embed_dim * scalar_bytes
-
-    splits = {
-        "train": len(dm.train_set),
-        "val": len(dm.val_set),
-        "test": len(dm.test_set),
-    }
-
-    split_stats = {}
-    for split_name, sample_count in splits.items():
-        raw_total = sample_count * num_patch_tokens * raw_patch_token_bytes
-        embed_total = sample_count * seq_len_with_cls * embed_token_bytes
-        split_stats[split_name] = {
-            "num_samples": int(sample_count),
-            "raw_patch_tokens_total": int(sample_count * num_patch_tokens),
-            "embedded_tokens_total": int(sample_count * seq_len_with_cls),
-            "raw_patch_tokens_bytes": int(raw_total),
-            "raw_patch_tokens_human": format_bytes(int(raw_total)),
-            "embedded_tokens_bytes": int(embed_total),
-            "embedded_tokens_human": format_bytes(int(embed_total)),
-        }
-
-    total_raw_bytes = sum(v["raw_patch_tokens_bytes"] for v in split_stats.values())
-    total_embed_bytes = sum(v["embedded_tokens_bytes"] for v in split_stats.values())
-
-    return {
-        "assumption": {
-            "model_name": cfg.model_name,
-            "scalar_dtype": scalar_dtype,
-            "scalar_bytes": scalar_bytes,
-            "image_size": cfg.image_size,
-            "patch_size": patch_size,
-            "num_prefix_tokens": num_prefix_tokens,
-            "in_channels": dm.in_channels,
-            "embed_dim": embed_dim,
-        },
-        "sequence": {
-            "patch_tokens_per_image": num_patch_tokens,
-            "tokens_per_image_with_cls": seq_len_with_cls,
-            "raw_patch_dim": raw_patch_dim,
-        },
-        "per_image": {
-            "raw_patch_tokens_bytes": int(num_patch_tokens * raw_patch_token_bytes),
-            "raw_patch_tokens_human": format_bytes(int(num_patch_tokens * raw_patch_token_bytes)),
-            "embedded_tokens_bytes": int(seq_len_with_cls * embed_token_bytes),
-            "embedded_tokens_human": format_bytes(int(seq_len_with_cls * embed_token_bytes)),
-        },
-        "splits": split_stats,
-        "total": {
-            "raw_patch_tokens_bytes": int(total_raw_bytes),
-            "raw_patch_tokens_human": format_bytes(int(total_raw_bytes)),
-            "embedded_tokens_bytes": int(total_embed_bytes),
-            "embedded_tokens_human": format_bytes(int(total_embed_bytes)),
-        },
-    }
-
-
 def train(cfg: ViTTrainConfig) -> None:
     output_dir = Path(cfg.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -770,7 +671,6 @@ def train(cfg: ViTTrainConfig) -> None:
     dm.setup()
 
     model = LitPathMNISTViT(cfg=cfg, in_channels=dm.in_channels, num_classes=dm.num_classes)
-    token_stats = estimate_token_stats(cfg, dm, model)
 
     monitor_metric = model.monitor_metric
     tb_logger = TensorBoardLogger(save_dir=str(output_dir), name="tb_logs")
@@ -820,7 +720,6 @@ def train(cfg: ViTTrainConfig) -> None:
             "num_val": len(dm.val_set),
             "num_test": len(dm.test_set),
         },
-        "token_stats": token_stats,
         "training_profile": profile_summary,
         "best_checkpoint": best_ckpt,
         "best_score": float(ckpt_callback.best_model_score.item()) if ckpt_callback.best_model_score is not None else None,
@@ -847,7 +746,9 @@ def train(cfg: ViTTrainConfig) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Train a ViT baseline with Lightning and profile token/memory/time stats.")
+    parser = argparse.ArgumentParser(
+        description="Train a pretrained ViT-Base-Patch16-224 baseline with Lightning."
+    )
     parser.add_argument(
         "--dataset",
         type=str,
@@ -856,12 +757,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default=None)
-    parser.add_argument("--model-name", type=str, default="vit_tiny_patch16_224")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
-    parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--label-smoothing", type=float, default=0.0)
     parser.add_argument("--warmup-ratio", type=float, default=0.05)
     parser.add_argument("--min-lr", type=float, default=1e-5)
@@ -873,7 +772,7 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
-    parser.add_argument("--precision", type=str, default="32")
+    parser.add_argument("--precision", type=str, default="bf16-mixed")
     parser.add_argument("--log-every-n-steps", type=int, default=20)
     return parser.parse_args()
 
@@ -887,12 +786,10 @@ def main() -> None:
         data_root=args.data_root,
         dataset=dataset,
         output_dir=output_dir,
-        model_name=args.model_name,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
-        image_size=args.image_size,
         label_smoothing=args.label_smoothing,
         warmup_ratio=args.warmup_ratio,
         min_lr=args.min_lr,
