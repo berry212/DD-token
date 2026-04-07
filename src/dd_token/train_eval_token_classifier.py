@@ -45,38 +45,23 @@ class TrainConfig:
     log_every_n_steps: int = 20
 
 
-HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
-_DERMAMNIST_ALIASES = {"dermamnist", "derma", "dermamnist+"}
+DATASET_NAME_CHOICES = ["pathmnist", "dermamnist"]
+_CODEBOOK_CANDIDATE_FILES = ("vqvae_codebook.npy", "vqvae_codebook.pt", "codebook.npy", "codebook.pt")
 
 
-def normalize_dataset_name(dataset: str) -> str:
+def check_dataset_name(dataset: str) -> str:
     normalized = dataset.strip().lower()
-    if normalized == "pathmnist":
-        return "pathmnist"
-    if normalized in _DERMAMNIST_ALIASES:
-        return "dermamnist"
-    if normalized in {"skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID.lower()}:
-        return "skin-lesions"
-    raise ValueError(
-        "Unsupported dataset name. Supported values: pathmnist, dermamnist, skin-lesions, "
-        f"{HF_SKIN_LESIONS_REPO_ID}."
-    )
+    if normalized in DATASET_NAME_CHOICES:
+        return normalized
+    raise ValueError("Critical Error")
 
 
 def default_token_dir_for_dataset(dataset: str) -> str:
-    if dataset == "dermamnist":
-        return "./artifacts/dermamnist_tokens"
-    if dataset == "skin-lesions":
-        return "./artifacts/skin_lesions_tokens"
-    return "./artifacts/pathmnist_tokens"
+    return f"./artifacts/{dataset}_tokens"
 
 
 def default_output_dir_for_dataset(dataset: str) -> str:
-    if dataset == "dermamnist":
-        return "./artifacts/dermamnist_vit"
-    if dataset == "skin-lesions":
-        return "./artifacts/skin_lesions_token_classifier"
-    return "./artifacts/token_classifier"
+    return f"./artifacts/{dataset}_classifier"
 
 
 def set_seed(seed: int) -> None:
@@ -97,16 +82,55 @@ def format_bytes(num_bytes: int) -> str:
 def load_split(path: Path) -> tuple[np.ndarray, np.ndarray]:
     with np.load(path) as data:
         tokens = data["tokens"].astype(np.int64)
-        labels = data["labels"]
+        labels = data["labels"].reshape(-1).astype(np.int64)
     return tokens, labels
 
 
+def find_codebook_path(token_dir: Path) -> Path:
+    for filename in _CODEBOOK_CANDIDATE_FILES:
+        path = token_dir / filename
+        if path.exists():
+            return path
+    raise FileNotFoundError(f"Codebook file not found in {token_dir}. Candidates: {_CODEBOOK_CANDIDATE_FILES}")
+
+
+def _extract_codebook_from_pt(payload) -> torch.Tensor:
+    if isinstance(payload, torch.Tensor):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("codebook", "embedding", "embeddings", "weight", "vqvae_codebook"):
+            value = payload.get(key)
+            if isinstance(value, torch.Tensor):
+                return value
+    raise ValueError("Unable to parse codebook tensor from .pt file.")
+
+
+def load_codebook_tensor(path: Path) -> torch.Tensor:
+    if path.suffix == ".npy":
+        codebook = torch.from_numpy(np.load(path))
+    else:
+        codebook = _extract_codebook_from_pt(torch.load(path, map_location="cpu"))
+
+    if codebook.ndim == 1:
+        codebook = codebook.unsqueeze(-1)
+    if codebook.ndim > 2:
+        codebook = codebook.reshape(codebook.shape[0], -1)
+    return codebook.to(dtype=torch.float32)
+
+
+def align_codebook_to_vocab(codebook: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    rows, cols = int(codebook.shape[0]), int(codebook.shape[1])
+    if rows == vocab_size:
+        aligned = codebook
+    elif cols == vocab_size:
+        aligned = codebook.transpose(0, 1).contiguous()
+    else:
+        aligned = codebook[:vocab_size]
+    return aligned.contiguous().to(dtype=torch.float32)
+
+
 def flatten_tokens_to_sequence(tokens: np.ndarray) -> np.ndarray:
-    if tokens.ndim == 2:
-        return tokens
-    if tokens.ndim == 4:
-        return tokens.reshape(tokens.shape[0], -1)
-    raise ValueError(f"Unsupported token tensor rank {tokens.ndim}. Expected 2D or 4D tokens.")
+    return tokens.reshape(tokens.shape[0], -1)
 
 
 def macro_f1_multiclass(y_true: torch.Tensor, y_pred: torch.Tensor, num_classes: int) -> float:
@@ -215,7 +239,7 @@ class TokenViTNoPatchEmbed(nn.Module):
     def __init__(
         self,
         model_name: str,
-        vocab_size: int,
+        codebook: torch.Tensor,
         seq_len: int,
         num_classes: int,
         pretrained: bool,
@@ -229,8 +253,13 @@ class TokenViTNoPatchEmbed(nn.Module):
         self.num_prefix_tokens = int(getattr(vit, "num_prefix_tokens", 1))
         self.max_seq_len = int(max(1, max_seq_len))
 
-        self.token_emb = nn.Embedding(vocab_size, self.embed_dim)
-        nn.init.trunc_normal_(self.token_emb.weight, std=0.02)
+        self.register_buffer("codebook", codebook.to(dtype=torch.float32))
+        self.code_dim = int(self.codebook.shape[1])
+        self.token_proj = nn.Sequential(
+            nn.Linear(self.code_dim, self.embed_dim),
+            nn.GELU(),
+            nn.Linear(self.embed_dim, self.embed_dim),
+        )
 
         cls_token = getattr(vit, "cls_token", None)
         if cls_token is None:
@@ -259,9 +288,6 @@ class TokenViTNoPatchEmbed(nn.Module):
                     param.requires_grad = False
 
     def _resize_pos_embed(self, pos_embed: torch.Tensor, target_seq_len: int) -> torch.Tensor:
-        if pos_embed.ndim != 3:
-            raise ValueError(f"Expected pos_embed shape [1, tokens, dim], got {tuple(pos_embed.shape)}")
-
         prefix = pos_embed[:, : self.num_prefix_tokens]
         body = pos_embed[:, self.num_prefix_tokens :]
         if body.size(1) == target_seq_len:
@@ -290,7 +316,8 @@ class TokenViTNoPatchEmbed(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids = self._maybe_subsample_tokens(token_ids)
-        x = self.token_emb(token_ids)
+        x = F.embedding(token_ids, self.codebook)
+        x = self.token_proj(x)
         cls = self.cls_token.expand(token_ids.size(0), -1, -1)
         x = torch.cat([cls, x], dim=1)
 
@@ -323,6 +350,8 @@ class TrainProfileCallback(Callback):
         self.epoch_peak_reserved_mb: list[float] = []
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         self.fit_start_time = time.perf_counter()
         self.epoch_train_time_sec.clear()
         self.epoch_peak_allocated_mb.clear()
@@ -331,11 +360,14 @@ class TrainProfileCallback(Callback):
             torch.cuda.reset_peak_memory_stats()
 
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         self.epoch_start_time = time.perf_counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
     def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = pl_module
         if self.epoch_start_time is None:
             return
 
@@ -362,6 +394,8 @@ class TrainProfileCallback(Callback):
                 experiment.add_scalar("profile/epoch_train_time_sec", duration, epoch_idx)
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         if self.fit_start_time is None:
             return
         self.total_train_time_sec = float(time.perf_counter() - self.fit_start_time)
@@ -403,6 +437,9 @@ class TokenDataModule(L.LightningDataModule):
         self.token_channels: int = 3
         self.token_grid_h: int = 0
         self.token_grid_w: int = 0
+        self.codebook_dim: int = 0
+        self.codebook_path: str | None = None
+        self.codebook: torch.Tensor | None = None
 
         self.class_weights: torch.Tensor | None = None
         self.token_size_stats: dict | None = None
@@ -412,6 +449,7 @@ class TokenDataModule(L.LightningDataModule):
         self.test_loader: DataLoader | None = None
 
     def setup(self, stage: str | None = None):
+        _ = stage
         train_path = self.token_dir / "train_tokens.npz"
         val_path = self.token_dir / "val_tokens.npz"
         test_path = self.token_dir / "test_tokens.npz"
@@ -419,20 +457,9 @@ class TokenDataModule(L.LightningDataModule):
         val_tokens, val_labels = load_split(val_path)
         test_tokens, test_labels = load_split(test_path)
 
-        if train_tokens.ndim == 2:
-            self.token_format = "sequence"
-            self.token_channels = 1
-            self.token_grid_h = 0
-            self.token_grid_w = 0
-        elif train_tokens.ndim == 4:
-            self.token_format = "sequence"
-            self.token_channels = int(train_tokens.shape[1])
-            self.token_grid_h = int(train_tokens.shape[2])
-            self.token_grid_w = int(train_tokens.shape[3])
-        else:
-            raise ValueError(
-                f"Unsupported token tensor rank {train_tokens.ndim}. Expected 2D sequence or 4D pseudo-image tokens."
-            )
+        self.token_channels = int(train_tokens.shape[1])
+        self.token_grid_h = int(train_tokens.shape[2])
+        self.token_grid_w = int(train_tokens.shape[3])
 
         train_tokens_flat = flatten_tokens_to_sequence(train_tokens)
         val_tokens_flat = flatten_tokens_to_sequence(val_tokens)
@@ -441,14 +468,13 @@ class TokenDataModule(L.LightningDataModule):
 
         self.vocab_size = int(max(train_tokens.max(), val_tokens.max(), test_tokens.max()) + 1)
 
-        if train_labels.ndim == 2 and train_labels.shape[1] == 1:
-            train_labels = train_labels.reshape(-1)
-            val_labels = val_labels.reshape(-1)
-            test_labels = test_labels.reshape(-1)
+        codebook_path = find_codebook_path(self.token_dir)
+        codebook = load_codebook_tensor(codebook_path)
+        codebook = align_codebook_to_vocab(codebook, self.vocab_size)
+        self.codebook = codebook
+        self.codebook_dim = int(codebook.shape[1])
+        self.codebook_path = str(codebook_path)
 
-        train_labels = train_labels.astype(np.int64)
-        val_labels = val_labels.astype(np.int64)
-        test_labels = test_labels.astype(np.int64)
         self.num_classes = int(max(train_labels.max(), val_labels.max(), test_labels.max()) + 1)
 
         train_sampler = build_weighted_sampler(train_labels, self.num_classes, balance_power=self.cfg.class_balance_power)
@@ -500,18 +526,12 @@ class TokenDataModule(L.LightningDataModule):
         )
 
     def train_dataloader(self) -> DataLoader:
-        if self.train_loader is None:
-            raise RuntimeError("DataModule is not setup yet.")
         return self.train_loader
 
     def val_dataloader(self) -> DataLoader:
-        if self.val_loader is None:
-            raise RuntimeError("DataModule is not setup yet.")
         return self.val_loader
 
     def test_dataloader(self) -> DataLoader:
-        if self.test_loader is None:
-            raise RuntimeError("DataModule is not setup yet.")
         return self.test_loader
 
 
@@ -523,7 +543,7 @@ class LitTokenClassifier(L.LightningModule):
 
         self.model = TokenViTNoPatchEmbed(
             model_name=cfg.model_name,
-            vocab_size=dm.vocab_size,
+            codebook=dm.codebook,
             seq_len=dm.seq_len,
             num_classes=dm.num_classes,
             pretrained=cfg.pretrained_backbone,
@@ -531,9 +551,7 @@ class LitTokenClassifier(L.LightningModule):
             max_seq_len=cfg.max_seq_len,
         )
 
-        weights = dm.class_weights if dm.class_weights is not None else None
-        if weights is not None:
-            weights = weights.clone().detach()
+        weights = dm.class_weights.clone().detach() if dm.class_weights is not None else None
         self.criterion = nn.CrossEntropyLoss(weight=weights, label_smoothing=cfg.label_smoothing)
         self.monitor_metric = "val_acc"
 
@@ -545,15 +563,19 @@ class LitTokenClassifier(L.LightningModule):
         self.test_probs: list[torch.Tensor] = []
 
         self.save_hyperparameters(asdict(cfg))
-        self.save_hyperparameters({
-            "vocab_size": dm.vocab_size,
-            "seq_len": dm.seq_len,
-            "num_classes": dm.num_classes,
-            "token_format": dm.token_format,
-            "token_channels": dm.token_channels,
-            "token_grid_h": dm.token_grid_h,
-            "token_grid_w": dm.token_grid_w,
-        })
+        self.save_hyperparameters(
+            {
+                "vocab_size": dm.vocab_size,
+                "seq_len": dm.seq_len,
+                "num_classes": dm.num_classes,
+                "token_format": dm.token_format,
+                "token_channels": dm.token_channels,
+                "token_grid_h": dm.token_grid_h,
+                "token_grid_w": dm.token_grid_w,
+                "codebook_dim": dm.codebook_dim,
+                "codebook_path": dm.codebook_path,
+            }
+        )
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.model(token_ids)
@@ -612,12 +634,14 @@ class LitTokenClassifier(L.LightningModule):
         return logits, labels, loss
 
     def training_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._shared_step(batch, stage="train")
         _ = logits
         _ = labels
         return loss
 
     def validation_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._shared_step(batch, stage="val")
 
         preds = torch.argmax(logits, dim=1)
@@ -676,6 +700,7 @@ class LitTokenClassifier(L.LightningModule):
         self.val_probs.clear()
 
     def test_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._shared_step(batch, stage="test")
 
         preds = torch.argmax(logits, dim=1)
@@ -708,10 +733,7 @@ class LitTokenClassifier(L.LightningModule):
         self.test_probs.clear()
 
     def configure_optimizers(self):
-        trainable_params = [p for p in self.parameters() if p.requires_grad]
-        if not trainable_params:
-            raise RuntimeError("No trainable parameters found. Check freeze settings.")
-        optimizer = torch.optim.AdamW(trainable_params, lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.lr, weight_decay=self.cfg.weight_decay)
 
         steps_per_epoch = max(1, len(self.dm.train_dataloader()))
         total_steps = self.cfg.epochs * steps_per_epoch
@@ -792,6 +814,8 @@ def train(cfg: TrainConfig) -> None:
             "token_channels": dm.token_channels,
             "token_grid_h": dm.token_grid_h,
             "token_grid_w": dm.token_grid_w,
+            "codebook_dim": dm.codebook_dim,
+            "codebook_path": dm.codebook_path,
         },
         "token_size_stats": dm.token_size_stats,
         "training_profile": profile_summary,
@@ -830,16 +854,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="pathmnist",
-        choices=[
-            "pathmnist",
-            "dermamnist",
-            "derma",
-            "dermamnist+",
-            "skin-lesions",
-            "skin_lesions",
-            "skin-lesions-classification",
-            HF_SKIN_LESIONS_REPO_ID,
-        ],
+        choices=["pathmnist", "dermamnist", "derma", "dermamnist+"],
     )
     parser.add_argument("--token-dir", type=str, default=None)
     parser.add_argument("--output-dir", type=str, default=None)
@@ -887,7 +902,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    dataset = normalize_dataset_name(args.dataset)
+    dataset = check_dataset_name(args.dataset)
     token_dir = args.token_dir if args.token_dir is not None else default_token_dir_for_dataset(dataset)
     output_dir = args.output_dir if args.output_dir is not None else default_output_dir_for_dataset(dataset)
 

@@ -6,7 +6,7 @@ MODEL="vit"
 DATASET="pathmnist"
 
 case "$FIRST_ARG" in
-    pathmnist|skin-lesions|skin_lesions|ahmed-ai/skin-lesions-classification-dataset)
+    pathmnist|dermamnist|derma|dermamnist+)
         MODEL="vit"
         DATASET="$FIRST_ARG"
         ;;
@@ -27,7 +27,7 @@ case "$MODEL" in
         sh script/train_baseline_mlp.sh "$DATASET"
         ;;
     *)
-        echo "Usage: sh script/train_baseline.sh [vit|resnet|mlp] [pathmnist|skin-lesions]" >&2
+        echo "Usage: sh script/train_baseline.sh [vit|resnet|mlp] [pathmnist|dermamnist]" >&2
         exit 1
         ;;
 esac

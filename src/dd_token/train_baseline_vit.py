@@ -1,15 +1,11 @@
 import argparse
-from bisect import bisect_right
-from io import BytesIO
 import json
 import math
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
 
 import lightning as L
-from huggingface_hub import HfApi, snapshot_download
 import medmnist
 import numpy as np
 import timm
@@ -18,9 +14,8 @@ import torch.nn as nn
 from lightning.pytorch.callbacks import Callback, EarlyStopping, LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 from medmnist import DermaMNIST, PathMNIST
-from PIL import Image
 from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 from torchvision import transforms
 
 
@@ -47,9 +42,8 @@ class ViTTrainConfig:
     log_every_n_steps: int = 20
 
 
-HF_SKIN_LESIONS_REPO_ID = "ahmed-ai/skin-lesions-classification-dataset"
 _DERMAMNIST_ALIASES = {"dermamnist", "derma", "dermamnist+"}
-DERMAMNIST_NATIVE_SIZE = 244
+DERMAMNIST_NATIVE_SIZE = 224
 PRETRAINED_VIT_BACKBONE = "vit_base_patch16_224"
 BACKBONE_IMAGE_SIZE = 224
 
@@ -60,30 +54,13 @@ def normalize_dataset_name(dataset: str) -> str:
         return "pathmnist"
     if normalized in _DERMAMNIST_ALIASES:
         return "dermamnist"
-    if normalized in {"skin-lesions", "skin_lesions", "skin-lesions-classification", HF_SKIN_LESIONS_REPO_ID.lower()}:
-        return "skin-lesions"
-    raise ValueError(
-        "Unsupported dataset name. Supported values: pathmnist, dermamnist, skin-lesions, "
-        f"{HF_SKIN_LESIONS_REPO_ID}."
-    )
+    raise ValueError("Unsupported dataset name. Supported values: pathmnist, dermamnist, derma, dermamnist+.")
 
 
 def default_output_dir_for_dataset(dataset: str) -> str:
-    if dataset == "skin-lesions":
-        return "./artifacts/skin_lesions_vit"
     if dataset == "dermamnist":
         return "./artifacts/dermamnist_vit_baseline"
     return "./artifacts/pathmnist_vit"
-
-
-def _import_pyarrow_parquet():
-    try:
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise ImportError(
-            "pyarrow is required for Hugging Face parquet datasets. Install it with `uv add pyarrow`."
-        ) from exc
-    return pq
 
 
 def set_seed(seed: int) -> None:
@@ -122,10 +99,7 @@ def multiclass_auc_ovr(y_true: torch.Tensor, y_prob: torch.Tensor) -> float | No
 
 
 def build_train_transform(cfg: ViTTrainConfig):
-    image_size = BACKBONE_IMAGE_SIZE
-    transform_list = []
-    if image_size > 0:
-        transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
+    transform_list = [transforms.Resize((BACKBONE_IMAGE_SIZE, BACKBONE_IMAGE_SIZE), antialias=True)]
     if cfg.train_augment:
         transform_list.append(transforms.RandomHorizontalFlip(p=0.5))
     transform_list.extend(
@@ -138,177 +112,14 @@ def build_train_transform(cfg: ViTTrainConfig):
 
 
 def build_eval_transform(cfg: ViTTrainConfig):
-    image_size = BACKBONE_IMAGE_SIZE
-    transform_list = []
-    if image_size > 0:
-        transform_list.append(transforms.Resize((image_size, image_size), antialias=True))
-    transform_list.extend(
+    _ = cfg
+    return transforms.Compose(
         [
+            transforms.Resize((BACKBONE_IMAGE_SIZE, BACKBONE_IMAGE_SIZE), antialias=True),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
         ]
     )
-    return transforms.Compose(transform_list)
-
-
-class HFParquetImageDataset(Dataset):
-    def __init__(
-        self,
-        parquet_paths: list[Path],
-        transform,
-        image_column: str = "image",
-        label_column: str = "label",
-    ):
-        if not parquet_paths:
-            raise ValueError("parquet_paths cannot be empty.")
-
-        self.parquet_paths = [Path(p) for p in parquet_paths]
-        self.transform = transform
-        self.image_column = image_column
-        self.label_column = label_column
-
-        self._index_map: list[tuple[int, int, int]] = []
-        self._cumulative_rows: list[int] = []
-        self._length = 0
-
-        self._parquet_files: dict[int, Any] = {}
-        self._cached_group_key: tuple[int, int] | None = None
-        self._cached_images: list[Any] | None = None
-        self._cached_labels: list[Any] | None = None
-
-        pq = _import_pyarrow_parquet()
-        for file_idx, parquet_path in enumerate(self.parquet_paths):
-            parquet_file = pq.ParquetFile(str(parquet_path))
-            for row_group_idx in range(parquet_file.num_row_groups):
-                num_rows = int(parquet_file.metadata.row_group(row_group_idx).num_rows)
-                if num_rows <= 0:
-                    continue
-                self._length += num_rows
-                self._index_map.append((file_idx, row_group_idx, num_rows))
-                self._cumulative_rows.append(self._length)
-
-        if self._length <= 0:
-            raise ValueError("No rows found in parquet files.")
-
-    def __getstate__(self):
-        state = dict(self.__dict__)
-        state["_parquet_files"] = {}
-        state["_cached_group_key"] = None
-        state["_cached_images"] = None
-        state["_cached_labels"] = None
-        return state
-
-    def __len__(self) -> int:
-        return self._length
-
-    def _decode_image(self, value: Any) -> Image.Image:
-        if isinstance(value, dict):
-            img_bytes = value.get("bytes")
-            img_path = value.get("path")
-            if img_bytes is not None:
-                with Image.open(BytesIO(img_bytes)) as img:
-                    return img.convert("RGB")
-            if img_path:
-                with Image.open(img_path) as img:
-                    return img.convert("RGB")
-
-        if isinstance(value, (bytes, bytearray)):
-            with Image.open(BytesIO(value)) as img:
-                return img.convert("RGB")
-
-        if isinstance(value, str):
-            with Image.open(value) as img:
-                return img.convert("RGB")
-
-        raise ValueError(f"Unsupported image value type: {type(value)}")
-
-    def _load_row_group(self, file_idx: int, row_group_idx: int) -> None:
-        key = (file_idx, row_group_idx)
-        if self._cached_group_key == key:
-            return
-
-        parquet_file = self._parquet_files.get(file_idx)
-        if parquet_file is None:
-            pq = _import_pyarrow_parquet()
-            parquet_file = pq.ParquetFile(str(self.parquet_paths[file_idx]))
-            self._parquet_files[file_idx] = parquet_file
-
-        table = parquet_file.read_row_group(row_group_idx, columns=[self.image_column, self.label_column])
-        self._cached_images = table.column(self.image_column).to_pylist()
-        self._cached_labels = table.column(self.label_column).to_pylist()
-        self._cached_group_key = key
-
-    def __getitem__(self, index):
-        if index < 0:
-            index = self._length + index
-
-        if index < 0 or index >= self._length:
-            raise IndexError(f"Index {index} out of range for dataset of length {self._length}.")
-
-        group_idx = bisect_right(self._cumulative_rows, index)
-        prev_cumulative = 0 if group_idx == 0 else self._cumulative_rows[group_idx - 1]
-        row_in_group = int(index - prev_cumulative)
-
-        file_idx, row_group_idx, _ = self._index_map[group_idx]
-        self._load_row_group(file_idx, row_group_idx)
-
-        if self._cached_images is None or self._cached_labels is None:
-            raise RuntimeError("Parquet row group cache is unexpectedly empty.")
-
-        image = self._decode_image(self._cached_images[row_in_group])
-        label = int(self._cached_labels[row_in_group])
-        image_tensor = self.transform(image) if self.transform is not None else image
-        return image_tensor, torch.tensor(label, dtype=torch.long)
-
-
-def _extract_hf_label_names(repo_id: str) -> list[str]:
-    info = HfApi().dataset_info(repo_id=repo_id)
-    card_data = info.cardData.to_dict() if info.cardData is not None else {}
-    dataset_info = card_data.get("dataset_info") if isinstance(card_data, dict) else None
-    features = dataset_info.get("features", []) if isinstance(dataset_info, dict) else []
-
-    for feature in features:
-        if not isinstance(feature, dict) or feature.get("name") != "label":
-            continue
-        dtype = feature.get("dtype")
-        if not isinstance(dtype, dict):
-            continue
-        class_label = dtype.get("class_label")
-        if not isinstance(class_label, dict):
-            continue
-
-        names = class_label.get("names")
-        if isinstance(names, list):
-            return [str(name) for name in names]
-        if isinstance(names, dict):
-            indexed = []
-            for key, value in names.items():
-                try:
-                    idx = int(key)
-                except (TypeError, ValueError):
-                    continue
-                indexed.append((idx, str(value)))
-            if indexed:
-                indexed.sort(key=lambda x: x[0])
-                return [name for _, name in indexed]
-    return []
-
-
-def _collect_parquet_split_files(snapshot_dir: Path, split_name: str) -> list[Path]:
-    data_dir = snapshot_dir / "data"
-    patterns = [f"{split_name}-*.parquet"]
-    if split_name == "validation":
-        patterns.append("val-*.parquet")
-
-    files: list[Path] = []
-    seen: set[Path] = set()
-    for pattern in patterns:
-        for path in sorted(data_dir.glob(pattern)):
-            resolved = path.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                files.append(path)
-    return files
 
 
 class ImageClassificationDataModule(L.LightningDataModule):
@@ -334,66 +145,33 @@ class ImageClassificationDataModule(L.LightningDataModule):
             self.train_set = PathMNIST(root=self.cfg.data_root, split="train", transform=train_transform, download=True)
             self.val_set = PathMNIST(root=self.cfg.data_root, split="val", transform=eval_transform, download=True)
             self.test_set = PathMNIST(root=self.cfg.data_root, split="test", transform=eval_transform, download=True)
-            self.num_classes = len(medmnist.INFO["pathmnist"]["label"])
-            self.label_names = [medmnist.INFO["pathmnist"]["label"][str(i)] for i in range(self.num_classes)]
-        elif self.cfg.dataset == "dermamnist":
-            try:
-                self.train_set = DermaMNIST(
-                    root=self.cfg.data_root,
-                    split="train",
-                    transform=train_transform,
-                    download=True,
-                    size=DERMAMNIST_NATIVE_SIZE,
-                )
-                self.val_set = DermaMNIST(
-                    root=self.cfg.data_root,
-                    split="val",
-                    transform=eval_transform,
-                    download=True,
-                    size=DERMAMNIST_NATIVE_SIZE,
-                )
-                self.test_set = DermaMNIST(
-                    root=self.cfg.data_root,
-                    split="test",
-                    transform=eval_transform,
-                    download=True,
-                    size=DERMAMNIST_NATIVE_SIZE,
-                )
-            except TypeError as exc:
-                raise RuntimeError(
-                    "Current medmnist does not support DermaMNIST `size` argument. "
-                    "Please upgrade medmnist (e.g., `uv add -U medmnist`)."
-                ) from exc
-
-            self.num_classes = len(medmnist.INFO["dermamnist"]["label"])
-            self.label_names = [medmnist.INFO["dermamnist"]["label"][str(i)] for i in range(self.num_classes)]
+            info_key = "pathmnist"
         else:
-            snapshot_dir = Path(
-                snapshot_download(
-                    repo_id=HF_SKIN_LESIONS_REPO_ID,
-                    repo_type="dataset",
-                    allow_patterns=["README.md", "data/*.parquet"],
-                    cache_dir=str(Path(self.cfg.data_root) / "hf_cache"),
-                )
+            self.train_set = DermaMNIST(
+                root=self.cfg.data_root,
+                split="train",
+                transform=train_transform,
+                download=True,
+                size=DERMAMNIST_NATIVE_SIZE,
             )
+            self.val_set = DermaMNIST(
+                root=self.cfg.data_root,
+                split="val",
+                transform=eval_transform,
+                download=True,
+                size=DERMAMNIST_NATIVE_SIZE,
+            )
+            self.test_set = DermaMNIST(
+                root=self.cfg.data_root,
+                split="test",
+                transform=eval_transform,
+                download=True,
+                size=DERMAMNIST_NATIVE_SIZE,
+            )
+            info_key = "dermamnist"
 
-            train_files = _collect_parquet_split_files(snapshot_dir, "train")
-            val_files = _collect_parquet_split_files(snapshot_dir, "validation")
-            test_files = _collect_parquet_split_files(snapshot_dir, "test")
-            if not train_files or not val_files or not test_files:
-                raise ValueError("Failed to find train/validation/test parquet splits for skin lesions dataset.")
-
-            self.train_set = HFParquetImageDataset(train_files, transform=train_transform)
-            self.val_set = HFParquetImageDataset(val_files, transform=eval_transform)
-            self.test_set = HFParquetImageDataset(test_files, transform=eval_transform)
-
-            self.label_names = _extract_hf_label_names(HF_SKIN_LESIONS_REPO_ID)
-            self.num_classes = len(self.label_names) if self.label_names else 14
-            if not self.label_names:
-                self.label_names = [str(i) for i in range(self.num_classes)]
-
-        sample_img, _ = self.train_set[0]
-        self.in_channels = int(sample_img.shape[0])
+        self.num_classes = len(medmnist.INFO[info_key]["label"])
+        self.label_names = [medmnist.INFO[info_key]["label"][str(i)] for i in range(self.num_classes)]
 
     def _loader(self, dataset, shuffle: bool):
         return DataLoader(
@@ -421,16 +199,11 @@ class LitPathMNISTViT(L.LightningModule):
         self.cfg = cfg
         self.num_classes = num_classes
 
-        if in_channels != 3:
-            raise ValueError(
-                f"{PRETRAINED_VIT_BACKBONE} pretrained weights require RGB in_channels=3, got {in_channels}."
-            )
-
         self.model = timm.create_model(
             PRETRAINED_VIT_BACKBONE,
             pretrained=True,
             num_classes=num_classes,
-            in_chans=3,
+            in_chans=in_channels,
             img_size=BACKBONE_IMAGE_SIZE,
         )
         for param in self.model.parameters():
@@ -497,6 +270,7 @@ class LitPathMNISTViT(L.LightningModule):
     def _step(self, batch, stage: str):
         images, labels = batch
         labels = labels.view(-1).long()
+
         logits = self(images)
         loss = self.criterion(logits, labels)
 
@@ -508,12 +282,14 @@ class LitPathMNISTViT(L.LightningModule):
         return logits, labels, loss
 
     def training_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._step(batch, stage="train")
         _ = logits
         _ = labels
         return loss
 
     def validation_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._step(batch, stage="val")
         preds = torch.argmax(logits, dim=1)
         probs = torch.softmax(logits, dim=1)
@@ -569,6 +345,7 @@ class LitPathMNISTViT(L.LightningModule):
         self.val_probs.clear()
 
     def test_step(self, batch, batch_idx):
+        _ = batch_idx
         logits, labels, loss = self._step(batch, stage="test")
         preds = torch.argmax(logits, dim=1)
         probs = torch.softmax(logits, dim=1)
@@ -633,6 +410,8 @@ class TrainProfileCallback(Callback):
         self.epoch_peak_reserved_mb: list[float] = []
 
     def on_fit_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         self.fit_start_time = time.perf_counter()
         self.epoch_train_time_sec.clear()
         self.epoch_peak_allocated_mb.clear()
@@ -641,11 +420,14 @@ class TrainProfileCallback(Callback):
             torch.cuda.reset_peak_memory_stats()
 
     def on_train_epoch_start(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         self.epoch_start_time = time.perf_counter()
         if torch.cuda.is_available():
             torch.cuda.reset_peak_memory_stats()
 
     def on_train_epoch_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = pl_module
         if self.epoch_start_time is None:
             return
 
@@ -672,6 +454,8 @@ class TrainProfileCallback(Callback):
                 experiment.add_scalar("profile/epoch_train_time_sec", duration, epoch_idx)
 
     def on_fit_end(self, trainer: L.Trainer, pl_module: L.LightningModule) -> None:
+        _ = trainer
+        _ = pl_module
         if self.fit_start_time is None:
             return
         self.total_train_time_sec = float(time.perf_counter() - self.fit_start_time)
@@ -749,7 +533,6 @@ def train(cfg: ViTTrainConfig) -> None:
         "config": asdict(cfg),
         "dataset": {
             "name": cfg.dataset,
-            "hf_repo_id": HF_SKIN_LESIONS_REPO_ID if cfg.dataset == "skin-lesions" else None,
             "num_classes": dm.num_classes,
             "label_names": dm.label_names,
             "in_channels": dm.in_channels,
@@ -790,16 +573,7 @@ def parse_args() -> argparse.Namespace:
         "--dataset",
         type=str,
         default="pathmnist",
-        choices=[
-            "pathmnist",
-            "dermamnist",
-            "derma",
-            "dermamnist+",
-            "skin-lesions",
-            "skin_lesions",
-            "skin-lesions-classification",
-            HF_SKIN_LESIONS_REPO_ID,
-        ],
+        choices=["pathmnist", "dermamnist", "derma", "dermamnist+"],
     )
     parser.add_argument("--data-root", type=str, default="./data")
     parser.add_argument("--output-dir", type=str, default=None)

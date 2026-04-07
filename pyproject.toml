@@ -28,7 +28,8 @@ dependencies = [
 ]
 
 [project.scripts]
-distill-pathmnist-tokens = "dd_token.distill_pathmnist_tokens:main"
+distill-tokens = "dd_token.distill_tokens:main"
+distill-pathmnist-tokens = "dd_token.distill_tokens:main"
 train-eval-token-classifier = "dd_token.train_eval_token_classifier:main"
 train-eval-token-mlp = "dd_token.train_eval_token_mlp:main"
 train-eval-token-resnet = "dd_token.train_eval_token_resnet:main"

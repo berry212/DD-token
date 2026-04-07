@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # set -euo pipefail
 
+IPC=100
+
 
 # DermaMNIST official 224 split distillation (MedMNIST+ native size)
-# uv run distill-pathmnist-tokens --dataset dermamnist \
+# uv run distill-tokens --dataset dermamnist \
 #     --data-root ./data \
 #     --output-dir ./artifacts/dermamnist_tokens \
 #     --epochs 5 \
@@ -16,10 +18,11 @@
 #     --warmup-ratio 0.05 \
 #     --min-lr 1e-5 \
 #     --image-size 224 \
-#     --num-workers 0
+#     --num-workers 0 \
+#     --ipc "$IPC"
 
 # PathMNIST example:
-uv run distill-pathmnist-tokens --dataset pathmnist \
+uv run distill-tokens --dataset pathmnist \
     --data-root ./data \
     --output-dir ./artifacts/pathmnist_tokens \
     --epochs 5 \
@@ -31,20 +34,5 @@ uv run distill-pathmnist-tokens --dataset pathmnist \
     --quant-temperature 1.0 \
     --warmup-ratio 0.05 \
     --min-lr 1e-5 \
-    --image-size 28
-
-# Skin lesions (Hugging Face dataset) example:
-# uv run distill-pathmnist-tokens --dataset skin-lesions \
-#     --data-root ./data \
-#     --output-dir ./artifacts/skin_lesions_tokens \
-#     --epochs 6 \
-#     --batch-size 64 \
-#     --rvq-stages 1 \
-#     --cls-weight 0.4 \
-#     --cls-weight-end 0.2 \
-#     --diversity-weight 0.05 \
-#     --quant-temperature 1.0 \
-#     --warmup-ratio 0.05 \
-#     --min-lr 1e-5 \
-#     --image-size 256 \
-#     --num-workers 6
+    --image-size 28 \
+    --ipc "$IPC"
