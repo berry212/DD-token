@@ -73,6 +73,7 @@ class DistillConfig:
     devices: int = 1
     precision: str = "bf16-mixed"
     log_every_n_steps: int = 20
+    ipc: int = 0
 
 
 def _import_pyarrow_parquet():
@@ -919,6 +920,158 @@ def export_split_tokens(
     }
 
 
+def _build_npz_size_stats(tokens_np: np.ndarray, labels_np: np.ndarray, npz_path: Path) -> dict[str, Any]:
+    raw_tokens_bytes = int(tokens_np.nbytes)
+    raw_labels_bytes = int(labels_np.nbytes)
+    raw_total_bytes = raw_tokens_bytes + raw_labels_bytes
+    file_bytes = int(npz_path.stat().st_size)
+    return {
+        "num_samples": int(tokens_np.shape[0]),
+        "tokens_shape": list(tokens_np.shape),
+        "labels_shape": list(labels_np.shape),
+        "raw_tokens_bytes": raw_tokens_bytes,
+        "raw_tokens_human": format_bytes(raw_tokens_bytes),
+        "raw_labels_bytes": raw_labels_bytes,
+        "raw_labels_human": format_bytes(raw_labels_bytes),
+        "raw_total_bytes": raw_total_bytes,
+        "raw_total_human": format_bytes(raw_total_bytes),
+        "npz_file_bytes": file_bytes,
+        "npz_file_human": format_bytes(file_bytes),
+    }
+
+
+def _compress_train_tokens_with_classwise_kmeans(
+    output_dir: Path,
+    ipc: int,
+    seed: int,
+    codebook_size: int,
+) -> dict[str, Any]:
+    if ipc <= 0:
+        raise ValueError("ipc must be > 0 when running class-wise kmeans compression.")
+
+    try:
+        from sklearn.cluster import MiniBatchKMeans
+    except ImportError as exc:
+        raise ImportError(
+            "scikit-learn is required for class-wise kmeans compression. Install it with `uv add scikit-learn`."
+        ) from exc
+
+    train_path = output_dir / "train_tokens.npz"
+    if not train_path.exists():
+        raise FileNotFoundError(f"Missing train token file: {train_path}")
+
+    with np.load(train_path) as data:
+        train_tokens = data["tokens"]
+        train_labels = data["labels"]
+
+    if train_labels.ndim == 2 and train_labels.shape[1] == 1:
+        train_labels = train_labels.reshape(-1)
+    if train_labels.ndim != 1:
+        raise ValueError(
+            "Class-wise kmeans IPC compression currently supports only 1D multiclass labels. "
+            f"Got labels shape: {tuple(train_labels.shape)}"
+        )
+
+    train_labels = train_labels.astype(np.int64)
+    if train_tokens.ndim == 4:
+        flat_tokens = train_tokens.reshape(train_tokens.shape[0], -1).astype(np.float32)
+        token_tail_shape = tuple(int(v) for v in train_tokens.shape[1:])
+    elif train_tokens.ndim == 2:
+        flat_tokens = train_tokens.astype(np.float32)
+        token_tail_shape = tuple(int(v) for v in train_tokens.shape[1:])
+    else:
+        raise ValueError(
+            f"Unsupported token tensor rank {train_tokens.ndim}. Expected rank 2 or 4 for kmeans compression."
+        )
+
+    unique_classes = sorted(int(c) for c in np.unique(train_labels))
+    selected_tokens: list[np.ndarray] = []
+    selected_labels: list[int] = []
+    per_class_before: dict[str, int] = {}
+    per_class_after: dict[str, int] = {}
+
+    for class_id in unique_classes:
+        class_indices = np.where(train_labels == class_id)[0]
+        class_count = int(class_indices.size)
+        if class_count <= 0:
+            continue
+
+        per_class_before[str(class_id)] = class_count
+        class_vectors = flat_tokens[class_indices]
+        n_clusters = int(min(ipc, class_count))
+        per_class_after[str(class_id)] = n_clusters
+
+        if n_clusters >= class_count:
+            chosen_local = np.arange(class_count, dtype=np.int64)
+        else:
+            batch_size = int(min(max(256, 8 * n_clusters), class_count))
+            kmeans = MiniBatchKMeans(
+                n_clusters=n_clusters,
+                random_state=seed,
+                batch_size=batch_size,
+                n_init="auto",
+            )
+            kmeans.fit(class_vectors)
+
+            centers = kmeans.cluster_centers_
+            cluster_assign = kmeans.labels_
+            chosen_local_list: list[int] = []
+
+            for cluster_id in range(n_clusters):
+                members = np.where(cluster_assign == cluster_id)[0]
+                center = centers[cluster_id]
+
+                if members.size > 0:
+                    candidate_vectors = class_vectors[members]
+                    nearest_member_idx = int(np.argmin(np.sum((candidate_vectors - center) ** 2, axis=1)))
+                    chosen_local_list.append(int(members[nearest_member_idx]))
+                else:
+                    fallback_idx = int(np.argmin(np.sum((class_vectors - center) ** 2, axis=1)))
+                    chosen_local_list.append(fallback_idx)
+
+            chosen_local = np.asarray(chosen_local_list, dtype=np.int64)
+
+        chosen_global = class_indices[chosen_local]
+        selected_tokens.append(flat_tokens[chosen_global])
+        selected_labels.extend([class_id] * int(chosen_global.size))
+
+    if not selected_tokens:
+        raise RuntimeError("Kmeans IPC compression produced zero selected tokens.")
+
+    compressed_flat = np.concatenate(selected_tokens, axis=0)
+    compressed_labels = np.asarray(selected_labels, dtype=np.int64)
+
+    if token_tail_shape:
+        compressed_tokens = compressed_flat.reshape((compressed_flat.shape[0],) + token_tail_shape)
+    else:
+        compressed_tokens = compressed_flat
+
+    compressed_tokens = np.rint(compressed_tokens).astype(np.int32)
+    if codebook_size > 0:
+        compressed_tokens = np.clip(compressed_tokens, 0, int(codebook_size) - 1)
+
+    full_backup_path = output_dir / "train_tokens_full.npz"
+    if not full_backup_path.exists():
+        np.savez_compressed(full_backup_path, tokens=train_tokens, labels=train_labels)
+
+    np.savez_compressed(train_path, tokens=compressed_tokens, labels=compressed_labels)
+
+    train_size_stats = _build_npz_size_stats(compressed_tokens, compressed_labels, train_path)
+    ratio = float(train_tokens.shape[0] / max(1, compressed_tokens.shape[0]))
+    return {
+        "enabled": True,
+        "ipc_requested": int(ipc),
+        "num_classes": int(len(unique_classes)),
+        "train_samples_before": int(train_tokens.shape[0]),
+        "train_samples_after": int(compressed_tokens.shape[0]),
+        "train_sample_compression_ratio": ratio,
+        "train_tokens_backup_path": str(full_backup_path),
+        "per_class_samples_before": per_class_before,
+        "per_class_samples_after": per_class_after,
+        "train_size_stats": train_size_stats,
+    }
+
+
 def make_export_loader(dataset, cfg: DistillConfig, shuffle: bool = False) -> DataLoader:
     return DataLoader(
         dataset,
@@ -1004,6 +1157,19 @@ def train_tokenizer(cfg: DistillConfig):
             device,
         ),
     }
+
+    token_size_splits_pre_kmeans = None
+    kmeans_ipc_summary = None
+    if cfg.ipc > 0:
+        token_size_splits_pre_kmeans = json.loads(json.dumps(token_size_splits))
+        kmeans_ipc_summary = _compress_train_tokens_with_classwise_kmeans(
+            output_dir=output_dir,
+            ipc=cfg.ipc,
+            seed=cfg.seed,
+            codebook_size=tokenizer.codebook_size,
+        )
+        token_size_splits["train"] = kmeans_ipc_summary["train_size_stats"]
+
     token_export_time_sec = float(time.perf_counter() - export_start_time)
     total_pipeline_time_sec = float(time.perf_counter() - pipeline_start_time)
 
@@ -1015,6 +1181,7 @@ def train_tokenizer(cfg: DistillConfig):
         "vqvae_subfolder": cfg.vqvae_subfolder,
         "vqvae_revision": cfg.vqvae_revision,
         "rvq_stages": cfg.rvq_stages,
+        "ipc": cfg.ipc,
         "codebook_size": tokenizer.codebook_size,
         "code_dim": tokenizer.code_dim,
         "state_dict": {k: v.detach().cpu() for k, v in tokenizer.state_dict().items()},
@@ -1040,6 +1207,7 @@ def train_tokenizer(cfg: DistillConfig):
         "codebook_size": tokenizer.codebook_size,
         "code_dim": tokenizer.code_dim,
         "rvq_stages": cfg.rvq_stages,
+        "ipc": cfg.ipc,
         "training_loss_terms": [
             "train_loss",
             "train_recon_loss",
@@ -1074,6 +1242,23 @@ def train_tokenizer(cfg: DistillConfig):
             "npz_file_human": format_bytes(int(total_npz_file_bytes)),
         },
     }
+
+    if token_size_splits_pre_kmeans is not None:
+        pre_raw_total_bytes = sum(v["raw_total_bytes"] for v in token_size_splits_pre_kmeans.values())
+        pre_npz_total_bytes = sum(v["npz_file_bytes"] for v in token_size_splits_pre_kmeans.values())
+        metadata["token_size_stats_before_kmeans"] = {
+            "splits": token_size_splits_pre_kmeans,
+            "total": {
+                "raw_total_bytes": int(pre_raw_total_bytes),
+                "raw_total_human": format_bytes(int(pre_raw_total_bytes)),
+                "npz_file_bytes": int(pre_npz_total_bytes),
+                "npz_file_human": format_bytes(int(pre_npz_total_bytes)),
+            },
+        }
+
+    if kmeans_ipc_summary is not None:
+        metadata["kmeans_ipc"] = kmeans_ipc_summary
+
     metadata["distill_profile"] = {
         **profile_summary,
         "token_export_time_sec": token_export_time_sec,
@@ -1121,6 +1306,15 @@ def parse_args():
     parser.add_argument("--no-blur", action="store_true")
     parser.add_argument("--image-size", type=int, default=128)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--ipc",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, run class-wise kmeans on train tokens after distillation. "
+            "Number of clusters per class equals ipc."
+        ),
+    )
 
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
@@ -1154,6 +1348,7 @@ def main():
         blur=not args.no_blur,
         image_size=args.image_size,
         seed=args.seed,
+        ipc=args.ipc,
         accelerator=args.accelerator,
         devices=args.devices,
         precision=args.precision,

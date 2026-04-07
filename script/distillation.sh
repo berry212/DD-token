@@ -3,26 +3,11 @@
 
 
 # DermaMNIST official 224 split distillation (MedMNIST+ native size)
-uv run distill-pathmnist-tokens --dataset dermamnist \
-    --data-root ./data \
-    --output-dir ./artifacts/dermamnist_tokens \
-    --epochs 5 \
-    --batch-size 16 \
-    --rvq-stages 1 \
-    --cls-weight 0.8 \
-    --cls-weight-end 0.5 \
-    --diversity-weight 0.05 \
-    --quant-temperature 1.0 \
-    --warmup-ratio 0.05 \
-    --min-lr 1e-5 \
-    --image-size 224
-
-# PathMNIST example:
-# uv run distill-pathmnist-tokens --dataset pathmnist \
+# uv run distill-pathmnist-tokens --dataset dermamnist \
 #     --data-root ./data \
-#     --output-dir ./artifacts/pathmnist_tokens \
+#     --output-dir ./artifacts/dermamnist_tokens \
 #     --epochs 5 \
-#     --batch-size 256 \
+#     --batch-size 16 \
 #     --rvq-stages 1 \
 #     --cls-weight 0.8 \
 #     --cls-weight-end 0.5 \
@@ -30,7 +15,23 @@ uv run distill-pathmnist-tokens --dataset dermamnist \
 #     --quant-temperature 1.0 \
 #     --warmup-ratio 0.05 \
 #     --min-lr 1e-5 \
-#     --image-size 28
+#     --image-size 224 \
+#     --num-workers 0
+
+# PathMNIST example:
+uv run distill-pathmnist-tokens --dataset pathmnist \
+    --data-root ./data \
+    --output-dir ./artifacts/pathmnist_tokens \
+    --epochs 5 \
+    --batch-size 256 \
+    --rvq-stages 1 \
+    --cls-weight 0.8 \
+    --cls-weight-end 0.5 \
+    --diversity-weight 0.05 \
+    --quant-temperature 1.0 \
+    --warmup-ratio 0.05 \
+    --min-lr 1e-5 \
+    --image-size 28
 
 # Skin lesions (Hugging Face dataset) example:
 # uv run distill-pathmnist-tokens --dataset skin-lesions \
